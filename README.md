@@ -62,6 +62,10 @@ uv run python scripts/watch.py --scenario demo_team3 --games 3 --record demo.mp4
 
 Human controls: `W`/`Up` thrust, `A`/`D` or arrows to turn, `Space` to shoot, `Esc` to quit.
 
+`--blue` / `--red` take one spec per team, or a comma-separated list assigning each ship
+individually (cycled). So `--blue human,heuristic_1.0` puts you in `blue_0` with an AI wingman, which
+is the most direct way to judge whether teammates actually cooperate.
+
 ## Scenarios
 
 Randomized spawns, for training and evaluation:

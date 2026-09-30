@@ -30,7 +30,9 @@ DIFFICULTY = {
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenario", default="demo_team2", choices=sorted(SCENARIOS))
-    ap.add_argument("--blue", default="heuristic_1.0", help="scripted name, 'human', or checkpoint path")
+    ap.add_argument("--blue", default="heuristic_1.0",
+                    help="scripted name, 'human', or checkpoint path. Comma-separated assigns per "
+                         "ship, e.g. 'human,heuristic_1.0' to fly with an AI wingman")
     ap.add_argument("--red", default="heuristic_1.0")
     ap.add_argument("--games", type=int, default=3)
     ap.add_argument("--seed", type=int, default=None)
@@ -43,25 +45,38 @@ def main():
     ap.add_argument("--record", default=None, help="Save to a video/gif (needs imageio)")
     args = ap.parse_args()
 
-    human_teams = [t for t in ("blue", "red") if getattr(args, t) == "human"]
-    difficulty = args.difficulty or ("normal" if human_teams else "brutal")
-    delay, fire_rate = DIFFICULTY[difficulty]
-
     cfg = get_scenario(args.scenario)
-    ai_teams = [t for t in ("blue", "red") if t not in human_teams]
-    if human_teams and fire_rate is not None:
-        for t in ai_teams:
-            cfg = set_team_fire_rate(cfg, t, fire_rate)
+    team_sizes = {"red": cfg.n_red, "blue": cfg.m_blue}
+    # Per-agent specs: one spec applies to the whole team, a comma-separated list assigns per ship
+    # (cycled), e.g. --blue human,heuristic_1.0 puts you in blue_0 with an AI wingman.
+    specs = {t: [s.strip() for s in getattr(args, t).split(",")] for t in ("red", "blue")}
+    assignment = {f"{t}_{i}": specs[t][i % len(specs[t])]
+                  for t, n in team_sizes.items() for i in range(n)}
+    human_agents = [a for a, s in assignment.items() if s == "human"]
 
-    policies = {}
-    for team in ("blue", "red"):
-        pol = resolve_policy(getattr(args, team), deterministic=not args.stochastic)
-        if human_teams and team in ai_teams and delay > 0:
+    difficulty = args.difficulty or ("normal" if human_agents else "brutal")
+    delay, fire_rate = DIFFICULTY[difficulty]
+    human_teams = {a.split("_")[0] for a in human_agents}
+    if human_agents and fire_rate is not None:
+        for t in ("red", "blue"):
+            if t not in human_teams:
+                cfg = set_team_fire_rate(cfg, t, fire_rate)
+
+    # One policy instance per distinct spec, so inference stays batched
+    cache = {}
+    for spec in set(assignment.values()):
+        pol = resolve_policy(spec, deterministic=not args.stochastic)
+        if human_agents and spec != "human" and delay > 0:
             pol = DelayedPolicy(pol, delay)
-        policies[team] = pol
-    if human_teams:
+        cache[spec] = pol
+    policies = {agent: cache[spec] for agent, spec in assignment.items()}
+
+    if human_agents:
+        print(f"You are flying: {', '.join(human_agents)}")
         print(f"Difficulty {difficulty}: AI reaction delay {delay} decisions, reload {fire_rate} frames")
-        print("Controls: W/Up thrust, A/D or Left/Right turn, Space shoot")
+        print("Controls: W/Up thrust, A/D or Left/Right turn, Space shoot, Esc quit")
+    for agent, spec in sorted(assignment.items()):
+        print(f"  {agent:8s} <- {spec}")
 
     env = TeamAsteroidsEnv(cfg, render_mode="rgb_array" if args.record else "human",
                            window=args.window, effects=not args.no_effects)
@@ -76,12 +91,14 @@ def main():
                         if event.type == pygame.QUIT or (
                                 event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
                             running = False
+                groups = {}
+                for a in env.agents:
+                    pol = policies[a]
+                    groups.setdefault(id(pol), (pol, []))[1].append(a)
                 actions = {}
-                for team, pol in policies.items():
-                    ags = [a for a in env.agents if a.startswith(team)]
-                    if ags:
-                        acts = pol.act(np.stack([env.get_obs(a) for a in ags]), [(env, a) for a in ags])
-                        actions.update(zip(ags, acts))
+                for pol, ags in groups.values():
+                    acts = pol.act(np.stack([env.get_obs(a) for a in ags]), [(env, a) for a in ags])
+                    actions.update(zip(ags, acts))
                 env.step(actions)
                 if args.record:
                     frames.append(env.render())
