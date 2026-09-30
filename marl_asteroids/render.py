@@ -57,19 +57,36 @@ class RenderState:
 
 class Renderer:
     def __init__(self, env, window: int = 1000, show_hud: bool = True, effects: bool = True,
-                 trail_length: int = 18):
+                 trail_length: int = 18, follow: Optional[str] = None, view_size: float = 1200.0,
+                 minimap: bool = True):
+        """
+        Args:
+            follow: agent name to keep centered. None renders the whole map scaled to the window.
+            view_size: world units across the viewport in follow mode (clamped to the map size).
+            minimap: draw a whole-map inset in follow mode.
+        """
         self.env = env
         self.window = window
         self.show_hud = show_hud
         self.effects = effects
         self.trail_length = trail_length
-        self.scale = window / max(env.width, env.height)
+        self.follow = follow
+        self.minimap = minimap
+        map_span = max(env.width, env.height)
+        if follow is None:
+            self.view_size = map_span
+            self.scale = window / map_span
+        else:
+            # Showing more than the map would draw empty space: each object appears once.
+            self.view_size = min(view_size, map_span)
+            self.scale = window / self.view_size
         self.surface = None
         self.screen = None
         self.clock = None
         self.state = RenderState()
         self.rng = np.random.default_rng(0)
         self._rock_shapes: dict = {}
+        self._cam = None  # last camera center, kept when the followed ship dies
 
     # ------------------------------------------------------------------ setup
 
@@ -80,7 +97,10 @@ class Renderer:
             return
         pygame.init()
         pygame.font.init()
-        size = (int(self.env.width * self.scale), int(self.env.height * self.scale))
+        if self.follow is None:
+            size = (int(self.env.width * self.scale), int(self.env.height * self.scale))
+        else:
+            size = (self.window, self.window)
         if mode == "human":
             pygame.display.init()
             pygame.display.set_caption("MARL Asteroids")
@@ -91,7 +111,9 @@ class Renderer:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("dejavusansmono,consolas,monospace", 15)
         self.font_big = pygame.font.SysFont("dejavusansmono,consolas,monospace", 30, bold=True)
+        self.font_small = pygame.font.SysFont("dejavusansmono,consolas,monospace", 11)
         self.bg = self._make_background(size)
+        self.stars = self._make_stars(size)  # tileable layer for the scrolling camera
 
     def _make_background(self, size):
         import pygame
@@ -101,14 +123,63 @@ class Renderer:
         for y in range(h):  # vertical gradient
             t = y / max(1, h - 1)
             bg.fill(tuple(int(a + (b - a) * t) for a, b in zip(BG_TOP, BG_BOTTOM)), (0, y, w, 1))
-        n = int(w * h / 4200)
-        pts = self.rng.random((n, 2)) * (w, h)
-        mag = self.rng.random(n)
-        for (x, y), m in zip(pts, mag):
-            v = int(40 + 150 * m ** 3)
-            r = 2 if m > 0.97 else 1
-            pygame.draw.circle(bg, (v, v, min(255, int(v * 1.1))), (int(x), int(y)), r)
+        bg.blit(self._make_stars(size), (0, 0))
         return bg
+
+    def _make_stars(self, size):
+        """Star layer with black as the transparent key, so it can be tiled while scrolling."""
+        import pygame
+
+        w, h = size
+        surf = pygame.Surface(size)
+        surf.fill((0, 0, 0))
+        rng = np.random.default_rng(12345)
+        n = int(w * h / 4200)
+        for (x, y), m in zip(rng.random((n, 2)) * (w, h), rng.random(n)):
+            v = int(40 + 150 * m ** 3)
+            pygame.draw.circle(surf, (v, v, min(255, int(v * 1.1))), (int(x), int(y)),
+                               2 if m > 0.97 else 1)
+        surf.set_colorkey((0, 0, 0))
+        return surf
+
+    # ------------------------------------------------------------------ camera
+
+    def _camera_center(self):
+        """World point to keep centered; holds the last position once the followed ship dies."""
+        if self.follow is None:
+            return np.array([self.env.width / 2, self.env.height / 2])
+        ship = self.env.ships.get(self.follow)
+        if ship is not None and ship.active:
+            self._cam = ship.pos.copy()
+        elif self._cam is None:
+            self._cam = np.array([self.env.width / 2, self.env.height / 2])
+        return self._cam
+
+    def _projector(self, cam, size, shake):
+        """World -> pixel mapping. In follow mode offsets are wrapped, so the torus seam is seamless."""
+        s = self.scale
+        cx, cy = size[0] / 2, size[1] / 2
+        ox, oy = shake
+        if self.follow is None:
+            def to_px(pos):
+                return int(pos[0] * s + ox), int(pos[1] * s + oy)
+        else:
+            w, h = self.env.width, self.env.height
+
+            def to_px(pos):
+                dx = (pos[0] - cam[0] + w / 2) % w - w / 2
+                dy = (pos[1] - cam[1] + h / 2) % h - h / 2
+                return int(cx + dx * s + ox), int(cy + dy * s + oy)
+        return to_px
+
+    def _visible(self, pos, cam, margin=0.0):
+        if self.follow is None:
+            return True
+        w, h = self.env.width, self.env.height
+        dx = abs((pos[0] - cam[0] + w / 2) % w - w / 2)
+        dy = abs((pos[1] - cam[1] + h / 2) % h - h / 2)
+        lim = self.view_size / 2 + margin
+        return dx <= lim and dy <= lim
 
     def _rock_shape(self, rock):
         """Stable irregular polygon per asteroid (cached by identity)."""
@@ -207,28 +278,43 @@ class Renderer:
         if self.effects and st.shake > 0.3:
             ox, oy = (self.rng.random(2) - 0.5) * st.shake
         surf = self.surface
-        surf.blit(self.bg, (int(ox * 0.3), int(oy * 0.3)))
+        size = surf.get_size()
+        cam = self._camera_center()
+        to_px = self._projector(cam, size, (ox, oy))
 
-        def to_px(pos):
-            return int(pos[0] * s + ox), int(pos[1] * s + oy)
+        if self.follow is None:
+            surf.blit(self.bg, (int(ox * 0.3), int(oy * 0.3)))
+        else:
+            # Scroll the star layer with the camera and tile it, so motion is readable and the
+            # torus seam is invisible.
+            surf.fill(BG_BOTTOM)
+            sw, sh = self.stars.get_size()
+            bx = int(-cam[0] * s + ox) % sw - sw
+            by = int(-cam[1] * s + oy) % sh - sh
+            for gx in (bx, bx + sw):
+                for gy in (by, by + sh):
+                    surf.blit(self.stars, (gx, gy))
 
-        # Ship trails
+        # Ship trails. Segments are skipped when the projected jump is huge, which covers both a
+        # ship wrapping in whole-map view and any leftover seam crossing.
         if self.effects:
+            jump = max(size) * 0.5
             for name, pts in st.trails.items():
                 if len(pts) < 2:
                     continue
                 col = TEAM_COLORS[env.ships[name].team_id]["trail"]
-                for i in range(1, len(pts)):
-                    if abs(pts[i][0] - pts[i - 1][0]) > env.width / 2 or \
-                       abs(pts[i][1] - pts[i - 1][1]) > env.height / 2:
-                        continue  # skip the segment that wraps across the map edge
-                    f = i / len(pts)
-                    pygame.draw.line(surf, tuple(int(c * f) for c in col),
-                                     to_px(pts[i - 1]), to_px(pts[i]), max(1, int(2.6 * f * s)))
+                proj = [to_px(p) for p in pts]
+                for i in range(1, len(proj)):
+                    a, b = proj[i - 1], proj[i]
+                    if abs(a[0] - b[0]) > jump or abs(a[1] - b[1]) > jump:
+                        continue
+                    f = i / len(proj)
+                    pygame.draw.line(surf, tuple(int(c * f) for c in col), a, b,
+                                     max(1, int(2.6 * f * s)))
 
         # Asteroids
         for rock in env.asteroids:
-            if not rock.active:
+            if not rock.active or not self._visible(rock.pos, cam, rock.radius):
                 continue
             _, poly, spin, craters = self._rock_shape(rock)
             th = env.frame * spin
@@ -252,7 +338,7 @@ class Renderer:
 
         # Bullets: bright core with a tapering glow tail so incoming fire is easy to read
         for b in env.bullets:
-            if not b.active:
+            if not b.active or not self._visible(b.pos, cam, 40.0):
                 continue
             glow = TEAM_COLORS[b.team_id]["glow"]
             px = to_px(b.pos)
@@ -266,6 +352,8 @@ class Renderer:
         # Ships
         for name, ship in env.ships.items():
             if not ship.active:
+                continue
+            if not self._visible(ship.pos, cam, ship.radius * 2):
                 continue
             col = TEAM_COLORS[ship.team_id]
             a, r = ship.angle, ship.radius
@@ -291,6 +379,12 @@ class Renderer:
                 pygame.draw.circle(surf, tuple(int(c * frac) for c in col["glow"]),
                                    to_px(nose), max(1, int(2.6 * s * frac)))
 
+        if self.follow is not None:
+            self._highlight_followed(surf, to_px)
+            if self.minimap:
+                self._draw_minimap(surf, cam)
+            # Drawn last so edge contacts are never clipped by the minimap inset
+            self._draw_offscreen_markers(surf, cam)
         if self.show_hud:
             self._draw_hud(surf)
 
@@ -300,6 +394,89 @@ class Renderer:
             self.clock.tick(fps)
             return None
         return np.transpose(np.array(pygame.surfarray.pixels3d(surf)), (1, 0, 2)).copy()
+
+    def _wrapped_delta(self, a, b):
+        w, h = self.env.width, self.env.height
+        return ((b[0] - a[0] + w / 2) % w - w / 2, (b[1] - a[1] + h / 2) % h - h / 2)
+
+    def _highlight_followed(self, surf, to_px):
+        """Ring the ship under the player's control so it is unmistakable in a crowd."""
+        import pygame
+
+        ship = self.env.ships.get(self.follow)
+        if ship is None or not ship.active:
+            return
+        r = max(8, int(ship.radius * self.scale * 2.2))
+        pygame.draw.circle(surf, (235, 240, 255), to_px(ship.pos), r, 1)
+
+    def _draw_offscreen_markers(self, surf, cam):
+        """Edge chevrons for ships outside the viewport, with distance in world units."""
+        import pygame
+
+        w, h = surf.get_size()
+        cx, cy = w / 2, h / 2
+        margin = 46  # keeps chevrons and their labels clear of the HUD strip along the top
+        for name, ship in self.env.ships.items():
+            if not ship.active or name == self.follow or self._visible(ship.pos, cam):
+                continue
+            dx, dy = self._wrapped_delta(cam, ship.pos)
+            dist = math.hypot(dx, dy)
+            if dist < 1e-6:
+                continue
+            px, py = dx * self.scale, dy * self.scale
+            if abs(px) < 1e-6 and abs(py) < 1e-6:
+                continue
+            # Push out to the window edge along the bearing
+            t = min((cx - margin) / max(abs(px), 1e-6), (cy - margin) / max(abs(py), 1e-6))
+            ex, ey = cx + px * t, cy + py * t
+            ang = math.atan2(py, px)
+            col = TEAM_COLORS[ship.team_id]["hull"]
+            tip = (ex + math.cos(ang) * 9, ey + math.sin(ang) * 9)
+            left = (ex + math.cos(ang + 2.5) * 9, ey + math.sin(ang + 2.5) * 9)
+            right = (ex + math.cos(ang - 2.5) * 9, ey + math.sin(ang - 2.5) * 9)
+            pygame.draw.polygon(surf, col, [tip, left, right])
+            label = self.font_small.render(f"{int(dist)}", True, col)
+            lx = min(max(ex - label.get_width() / 2, 2), w - label.get_width() - 2)
+            ly = min(max(ey - math.sin(ang) * 16 - 6, 2), h - label.get_height() - 2)
+            surf.blit(label, (int(lx), int(ly)))
+
+    def _draw_minimap(self, surf, cam):
+        """Whole-map inset: rocks, ships, the followed ship, and the current viewport."""
+        import pygame
+
+        env = self.env
+        side = max(110, int(min(surf.get_size()) * 0.17))
+        pad = 12
+        x0, y0 = surf.get_width() - side - pad, surf.get_height() - side - pad
+        panel = pygame.Surface((side, side))
+        panel.set_alpha(165)
+        panel.fill((10, 12, 24))
+        surf.blit(panel, (x0, y0))
+        pygame.draw.rect(surf, (70, 78, 100), (x0, y0, side, side), 1)
+        k = side / max(env.width, env.height)
+
+        def mp(pos):
+            return int(x0 + pos[0] * k), int(y0 + pos[1] * k)
+
+        for rock in env.asteroids:
+            if rock.active:
+                pygame.draw.circle(surf, (96, 92, 108), mp(rock.pos), max(1, int(rock.radius * k)))
+        for name, ship in env.ships.items():
+            if not ship.active:
+                continue
+            col = TEAM_COLORS[ship.team_id]["hull"]
+            pygame.draw.circle(surf, col, mp(ship.pos), 3 if name == self.follow else 2)
+            if name == self.follow:
+                pygame.draw.circle(surf, (255, 255, 255), mp(ship.pos), 5, 1)
+        # Viewport box, drawn in up to four pieces so it wraps with the torus
+        vs = self.view_size * k
+        bx, by = cam[0] * k - vs / 2, cam[1] * k - vs / 2
+        for gx in (bx, bx + side, bx - side):
+            for gy in (by, by + side, by - side):
+                r = pygame.Rect(int(x0 + gx), int(y0 + gy), int(vs), int(vs))
+                clipped = r.clip(pygame.Rect(x0, y0, side, side))
+                if clipped.width > 1 and clipped.height > 1:
+                    pygame.draw.rect(surf, (200, 210, 235), clipped, 1)
 
     def _draw_hud(self, surf):
         env = self.env

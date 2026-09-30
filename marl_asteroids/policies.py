@@ -201,11 +201,22 @@ class DelayedPolicy(Policy):
 
 
 class HumanPolicy(Policy):
-    """Keyboard control (WASD/arrows + space). Requires a pygame window."""
+    """Keyboard control (WASD/arrows + space). Requires a pygame display.
+
+    Without one (headless, or ``rgb_array`` recording, which draws to an offscreen surface) there is
+    no keyboard to read, so this idles instead of raising.
+    """
     name = "human"
+    _warned = False
 
     def act(self, obs, contexts):
         import pygame
+
+        if not pygame.display.get_init() or pygame.display.get_surface() is None:
+            if not HumanPolicy._warned:
+                HumanPolicy._warned = True
+                print("HumanPolicy: no pygame display available, idling (keyboard needs a window)")
+            return np.zeros((len(contexts), 3), dtype=np.int64)
         keys = pygame.key.get_pressed()
         thrust = int(keys[pygame.K_UP] or keys[pygame.K_w])
         turn = 1 if (keys[pygame.K_LEFT] or keys[pygame.K_a]) else (2 if (keys[pygame.K_RIGHT] or keys[pygame.K_d]) else 0)

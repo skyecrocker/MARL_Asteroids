@@ -62,6 +62,25 @@ uv run python scripts/watch.py --scenario demo_team3 --games 3 --record demo.mp4
 
 Human controls: `W`/`Up` thrust, `A`/`D` or arrows to turn, `Space` to shoot, `Esc` to quit.
 
+### Follow camera
+
+By default the whole map is scaled into the window, which leaves ships only a few pixels wide on the
+large arenas. `--follow` instead centers one ship and shows a local viewport:
+
+```bash
+uv run python scripts/watch.py --scenario team3_large --blue human,heuristic_1.0,heuristic_1.0 \
+    --red heuristic_0.75 --difficulty easy --view 1300
+```
+
+- `--follow auto` (default) tracks your ship when you are playing, otherwise shows the whole map.
+  Pass an agent name to track a specific ship, or `none` to force the whole-map view.
+- `--view` sets how many world units span the viewport (clamped to the map size).
+- Ships outside the viewport appear as team-colored chevrons on the screen edge labeled with their
+  distance, and a minimap inset shows the whole map plus the current viewport box (`--no-minimap`
+  turns it off).
+- The projection wraps across the torus seam, so an enemy just past the map edge is drawn adjacent
+  rather than a whole map away. The starfield scrolls and tiles with the camera.
+
 `--blue` / `--red` take one spec per team, or a comma-separated list assigning each ship
 individually (cycled). So `--blue human,heuristic_1.0` puts you in `blue_0` with an AI wingman, which
 is the most direct way to judge whether teammates actually cooperate.

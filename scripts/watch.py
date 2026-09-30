@@ -42,6 +42,12 @@ def main():
                     help="Grow the arena by this factor (ships/weapons/sensors unchanged)")
     ap.add_argument("--asteroid-density", type=float, default=1.0,
                     help="Asteroid count multiplier applied when --scale is used")
+    ap.add_argument("--follow", default="auto",
+                    help="Agent to keep centered ('auto' = your ship if playing, else whole map, "
+                         "'none' forces whole map)")
+    ap.add_argument("--view", type=float, default=1200.0,
+                    help="World units across the viewport in follow mode")
+    ap.add_argument("--no-minimap", action="store_true")
     ap.add_argument("--no-effects", action="store_true", help="Disable particles/trails/flames")
     ap.add_argument("--difficulty", choices=sorted(DIFFICULTY), default=None,
                     help="Handicap the non-human side (defaults to 'normal' when one side is human)")
@@ -85,12 +91,27 @@ def main():
     for agent, spec in sorted(assignment.items()):
         print(f"  {agent:8s} <- {spec}")
 
+    if args.follow == "auto":
+        follow = human_agents[0] if human_agents else None
+    elif args.follow == "none":
+        follow = None
+    else:
+        follow = args.follow
+        if follow not in assignment:
+            ap.error(f"--follow {follow!r} is not an agent in this scenario: {sorted(assignment)}")
+    if follow:
+        print(f"Camera follows {follow} ({args.view:.0f} world units across)")
+
     env = TeamAsteroidsEnv(cfg, render_mode="rgb_array" if args.record else "human",
-                           window=args.window, effects=not args.no_effects)
+                           window=args.window, effects=not args.no_effects,
+                           follow=follow, view_size=args.view, minimap=not args.no_minimap)
     frames = []
     try:
         for game in range(args.games):
             env.reset(seed=None if args.seed is None else args.seed + game)
+            first = env.render()  # initializes pygame before any policy polls the keyboard
+            if args.record and first is not None:
+                frames.append(first)
             running = True
             while env.agents and running:
                 if not args.record:
