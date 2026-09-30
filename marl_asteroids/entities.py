@@ -22,6 +22,7 @@ class Ship(Entity):
         self.angle = 0.0  # Radians
         self.fire_rate = int(fire_rate if fire_rate is not None else config.fire_rate)
         self.cooldown = 0
+        self.thrusting = False  # Last commanded thrust; used only for rendering the flame
 
 
 class Asteroid(Entity):

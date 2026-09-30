@@ -72,6 +72,37 @@ def record_game(env: TeamAsteroidsEnv, stats: MatchStats):
             stats.env_deaths[_team_str(victim)] += 1
 
 
+def play_matches_mirrored(config: GameConfig, a: Policy, b: Policy, n_games: int,
+                          n_parallel: int = 16, seed: Optional[int] = 0) -> MatchStats:
+    """Mirrored evaluation: every seed is played twice with the teams swapped.
+
+    Cancels spawn/orientation advantage, which otherwise adds bias when one side happens to start in
+    a better position. Returns stats from ``a``'s perspective (reported in the "blue" fields).
+    Requires symmetric team sizes.
+    """
+    if config.n_red != config.m_blue:
+        raise ValueError("mirrored evaluation requires symmetric teams (n_red == m_blue)")
+    half = n_games // 2
+    first = play_matches(config, a, b, half, n_parallel, seed)
+    second = play_matches(config, b, a, n_games - half, n_parallel, seed)  # same seeds, swapped colors
+    return _merge_swapped(first, second)
+
+
+def _merge_swapped(first: MatchStats, second: MatchStats) -> MatchStats:
+    """Combine a normal run with a color-swapped run, keeping 'blue' = the first run's blue policy."""
+    m = MatchStats()
+    m.blue_wins = first.blue_wins + second.red_wins
+    m.red_wins = first.red_wins + second.blue_wins
+    m.draws_timeout = first.draws_timeout + second.draws_timeout
+    m.draws_mutual = first.draws_mutual + second.draws_mutual
+    m.lengths = first.lengths + second.lengths
+    for field in ("kills", "teamkills", "env_deaths"):
+        fa, fb = getattr(first, field), getattr(second, field)
+        getattr(m, field)["blue"] = fa["blue"] + fb["red"]
+        getattr(m, field)["red"] = fa["red"] + fb["blue"]
+    return m
+
+
 def play_matches(config: GameConfig, blue: Policy, red: Policy, n_games: int,
                  n_parallel: int = 16, seed: Optional[int] = 0, render: bool = False) -> MatchStats:
     """Play ``n_games`` games, ``n_parallel`` at a time, with batched policy inference."""

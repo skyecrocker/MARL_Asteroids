@@ -9,6 +9,7 @@ Scripted policies use the contexts (exact physics state); network policies use t
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -167,6 +168,36 @@ class NetworkPolicy(Policy):
         model = PPO.load(path, device=device)
         model.policy.set_training_mode(False)
         return cls(model.policy, name=name or path, deterministic=deterministic)
+
+
+class DelayedPolicy(Policy):
+    """Handicap: act on an observation from ``delay`` decision steps ago (a reaction time).
+
+    Wraps any observation-driven policy and needs no retraining. Note this does not affect scripted
+    policies, which read the live environment state directly rather than the observation.
+    """
+
+    def __init__(self, inner: Policy, delay: int):
+        self.inner = inner
+        self.delay = int(delay)
+        self.name = f"{inner.name}+delay{delay}"
+        self._buf: dict = {}
+
+    def act(self, obs, contexts):
+        if self.delay <= 0 or len(obs) == 0:
+            return self.inner.act(obs, contexts)
+        obs = np.asarray(obs)
+        delayed = np.empty_like(obs)
+        for i, (env, agent) in enumerate(contexts):
+            key = (id(env), agent)
+            state = self._buf.get(key)
+            if state is None or env.decision_step <= state[0]:  # new episode in this env slot
+                state = [env.decision_step, deque([obs[i]] * (self.delay + 1), maxlen=self.delay + 1)]
+                self._buf[key] = state
+            state[0] = env.decision_step
+            state[1].append(obs[i])
+            delayed[i] = state[1][0]
+        return self.inner.act(delayed, contexts)
 
 
 class HumanPolicy(Policy):

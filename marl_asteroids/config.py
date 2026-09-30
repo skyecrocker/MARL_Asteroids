@@ -4,7 +4,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 GAME_WIDTH = 800.0
 GAME_HEIGHT = 800.0
@@ -55,6 +55,8 @@ class RewardConfig:
     aim_weight: float = 1.0       # Potential for pointing the lead-aim at the nearest enemy
     approach_weight: float = 0.3  # Potential for being within firing range of an enemy
     hazard_weight: float = 1.0    # Negative potential for imminent collisions
+    engage_range: float = 250.0   # px; full approach credit inside this distance
+    engage_falloff: float = 400.0 # px; approach credit decays to 0 this far beyond engage_range
 
 
 @dataclass
@@ -95,15 +97,27 @@ class GameConfig:
     asteroid_large_radius: float = 30.0
     asteroid_medium_radius: float = 15.0
     asteroid_small_radius: float = 7.0
+    # When asteroids_split is True, a hit rock breaks into two smaller, faster fragments
+    # (size 1 fragments are destroyed outright). When False, rocks are indestructible cover.
+    asteroid_split_speedup: float = 1.4
+    asteroid_split_spread: float = math.pi / 4
+    # Floor on fragment speed: a slow or stationary parent would otherwise produce fragments that
+    # never separate and sit stacked on the parent's position.
+    asteroid_split_min_speed: float = 0.7
 
     # Episode
     max_frames: int = 1200     # Truncation limit in physics frames
     action_repeat: int = 2     # Physics frames per agent decision
 
+    # Observation length scale (px). Relative positions/distances are normalized by this and
+    # clipped, NOT by the map size, so the world can be resized without changing what the policy
+    # sees. Also the natural place to attach a real sensor range later.
+    sensor_range: float = 500.0
+
     # Observation slots (k-nearest of each type, sorted by distance)
     obs_enemies: int = 3
     obs_allies: int = 2
-    obs_asteroids: int = 6
+    obs_asteroids: int = 8  # Splitting can put many fragments nearby
     obs_bullets: int = 6
 
     rewards: RewardConfig = field(default_factory=RewardConfig)
@@ -119,26 +133,81 @@ class GameConfig:
 
 
 # ---------------------------------------------------------------------------
-# Scenarios. Everything uses random spawns unless noted.
+# Scenarios
 # ---------------------------------------------------------------------------
 
+
+def _line_formation(n: int, x: float, y_center: float, spacing: float, angle: float) -> List[EntityState]:
+    """n ships in a vertical line at x, centered on y_center, all facing ``angle``."""
+    y0 = y_center - spacing * (n - 1) / 2
+    angle = (angle + math.pi) % (2 * math.pi) - math.pi  # normalize to [-pi, pi]
+    return [EntityState(x=x, y=y0 + i * spacing, angle=angle) for i in range(n)]
+
+
+def static_battle(n: int, width: float, height: float, asteroids: Sequence[tuple] = (),
+                  spacing: float = 320.0, inset: float = 0.3, facing: float = math.pi / 2,
+                  **kw) -> GameConfig:
+    """Deterministic n-vs-n setup: red on the left, blue on the right, exactly 180-degree symmetric.
+
+    A rotation by 180 degrees about the map center maps red onto blue, so neither side has a
+    positional advantage: red faces ``facing`` and blue faces ``facing + pi``. The default
+    perpendicular heading means both teams must turn to engage, which gives a human time to react
+    instead of starting in the crosshairs.
+
+    ``inset`` must be greater than 0.25: at exactly 0.25 the teams sit half a map apart, which is
+    the antipodal case on a torus where "shortest path to the enemy" is a tie. Both sides then
+    resolve it to the same world direction, which silently breaks the mirror symmetry.
+
+    Fully reproducible (no spawn noise), for demos, videos, debugging, and human play. Prefer
+    mirrored evaluation over static spawns for *measurement*: with deterministic policies a static
+    scenario replays the same game every time.
+    """
+    return GameConfig(
+        n_red=n, m_blue=n, width=width, height=height,
+        num_asteroids=len(asteroids),
+        red_spawns=_line_formation(n, width * inset, height / 2, spacing, facing),
+        blue_spawns=_line_formation(n, width * (1 - inset), height / 2, spacing, facing + math.pi),
+        asteroid_spawns=[EntityState(x=x, y=y, vx=vx, vy=vy, size=size)
+                         for x, y, vx, vy, size in asteroids],
+        **kw,
+    )
+
+
+# Demo maps are larger (more room to react) with proportionally larger ships so everything stays
+# readable on screen. Difficulty for human play comes mainly from the AI handicaps in
+# set_team_fire_rate / policies.DelayedPolicy, not from map size alone.
+DEMO_W = DEMO_H = 1200.0
+DEMO_SCALE = dict(ship_radius=15.0, bullet_radius=3.5, max_speed=4.5,
+                  asteroid_large_radius=38.0, asteroid_medium_radius=20.0, asteroid_small_radius=10.0,
+                  max_frames=2000, min_spawn_dist=220.0)
+_DEMO_ROCKS = [
+    (DEMO_W * 0.5, DEMO_H * 0.25, 0.0, 0.35, 3),
+    (DEMO_W * 0.5, DEMO_H * 0.75, 0.0, -0.35, 3),
+    (DEMO_W * 0.32, DEMO_H * 0.5, 0.3, 0.0, 2),
+    (DEMO_W * 0.68, DEMO_H * 0.5, -0.3, 0.0, 2),
+]
+
 SCENARIOS: Dict[str, GameConfig] = {
+    # --- Training / evaluation (randomized spawns) ---
     "duel": GameConfig(n_red=1, m_blue=1, num_asteroids=0),
-    "duel_rocks": GameConfig(n_red=1, m_blue=1, num_asteroids=2),
-    "team2": GameConfig(n_red=2, m_blue=2, num_asteroids=2),
-    "team3": GameConfig(n_red=3, m_blue=3, num_asteroids=4),
-    # 2v1 / 1v2 imbalance scenarios encourage cooperation (focus fire, covering).
-    "team2_vs_1": GameConfig(n_red=1, m_blue=2, num_asteroids=2),
-    "hidden_target": GameConfig(
-        n_red=1, m_blue=1, num_asteroids=2,
-        red_spawns=[EntityState(x=GAME_WIDTH / 3, y=GAME_HEIGHT / 2, angle=0)],
-        blue_spawns=[EntityState(x=2 * GAME_WIDTH / 3, y=GAME_HEIGHT / 2,
-                                 angle=math.pi / 2, angle_noise=0.10)],
-        asteroid_spawns=[
-            EntityState(x=GAME_WIDTH / 2, y=GAME_HEIGHT / 2),
-            EntityState(x=GAME_WIDTH / 4, y=GAME_HEIGHT / 2),
-        ],
-    ),
+    "duel_rocks": GameConfig(n_red=1, m_blue=1, num_asteroids=3, asteroids_split=True),
+    "team2": GameConfig(n_red=2, m_blue=2, num_asteroids=4, asteroids_split=True),
+    "team3": GameConfig(n_red=3, m_blue=3, num_asteroids=6, asteroids_split=True),
+    # Imbalanced games encourage cooperation (focus fire, covering a weaker side).
+    "team2_vs_1": GameConfig(n_red=1, m_blue=2, num_asteroids=4, asteroids_split=True),
+    # Dense field: asteroid dodging and splitting dominate.
+    "asteroid_storm": GameConfig(n_red=2, m_blue=2, num_asteroids=10, asteroids_split=True,
+                                 asteroid_speed_range=(0.8, 2.0)),
+    # Indestructible cover: rocks block shots instead of breaking apart.
+    "obstacles": GameConfig(n_red=2, m_blue=2, num_asteroids=5, asteroids_split=False),
+
+    # --- Static, symmetric, human-scale (demos, videos, debugging) ---
+    "demo_duel": static_battle(1, DEMO_W, DEMO_H, _DEMO_ROCKS[:2], asteroids_split=True, **DEMO_SCALE),
+    "demo_team2": static_battle(2, DEMO_W, DEMO_H, _DEMO_ROCKS, spacing=300.0,
+                               asteroids_split=True, **DEMO_SCALE),
+    "demo_team3": static_battle(3, DEMO_W, DEMO_H, _DEMO_ROCKS, spacing=290.0,
+                               asteroids_split=True, **DEMO_SCALE),
+    "demo_open": static_battle(1, DEMO_W, DEMO_H, **DEMO_SCALE),
 }
 
 # Evaluation suite mirroring the legacy report's levels 1-4.
@@ -155,3 +224,22 @@ def get_scenario(name: str, **overrides) -> GameConfig:
     if name not in SCENARIOS:
         raise KeyError(f"Unknown scenario {name!r}. Available: {sorted(SCENARIOS)}")
     return SCENARIOS[name].replace(**overrides)
+
+
+def set_team_fire_rate(config: GameConfig, team: str, fire_rate: int) -> GameConfig:
+    """Return a copy where every ship on ``team`` ('red'/'blue') reloads in ``fire_rate`` frames.
+
+    A slower trigger is the most effective way to handicap an AI opponent for human play: it keeps
+    the agent's movement and aim intact but caps its damage output. Requires no retraining.
+    """
+    cfg = config.replace()
+    n = cfg.n_red if team == "red" else cfg.m_blue
+    spawns = list(cfg.red_spawns if team == "red" else cfg.blue_spawns)
+    while len(spawns) < n:
+        spawns.append(EntityState(random_spawn=True))
+    spawns = [dataclasses.replace(bp, fire_rate=fire_rate) for bp in spawns]
+    if team == "red":
+        cfg.red_spawns = spawns
+    else:
+        cfg.blue_spawns = spawns
+    return cfg

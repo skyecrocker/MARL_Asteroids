@@ -9,7 +9,7 @@ import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
 from .config import GameConfig, get_scenario
-from .matches import play_matches
+from .matches import play_matches, play_matches_mirrored
 from .policies import NetworkPolicy, make_scripted
 
 
@@ -108,8 +108,10 @@ class WinRateEvalCallback(BaseCallback):
         learner = NetworkPolicy(self.model.policy, name="learner", deterministic=True)
         rates, row = [], {"timesteps": self.num_timesteps}
         for scenario, opp in self.suite:
-            stats = play_matches(get_scenario(scenario), learner, make_scripted(opp, seed=self.seed),
-                                 self.n_games, n_parallel=min(32, self.n_games), seed=self.seed)
+            cfg = get_scenario(scenario)
+            runner = play_matches_mirrored if cfg.n_red == cfg.m_blue else play_matches
+            stats = runner(cfg, learner, make_scripted(opp, seed=self.seed), self.n_games,
+                           n_parallel=min(32, self.n_games), seed=self.seed)
             s = stats.summary()
             key = f"{scenario}_vs_{opp}"
             self.logger.record(f"eval/{key}/win_rate", s["blue_win_rate"])

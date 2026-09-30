@@ -50,9 +50,11 @@ def obs_dim(config: GameConfig) -> int:
 class TeamAsteroidsEnv(ParallelEnv):
     metadata = {"render_modes": ["human", "rgb_array"], "name": "team_asteroids_v1", "render_fps": 60}
 
-    def __init__(self, config: GameConfig, render_mode: Optional[str] = None):
+    def __init__(self, config: GameConfig, render_mode: Optional[str] = None, **render_options):
         self.config = config
         self.render_mode = render_mode
+        self.render_options = render_options  # forwarded to render.Renderer
+        self.renderer = None
         self.n_red = config.n_red
         self.m_blue = config.m_blue
         self.width = float(config.width)
@@ -80,8 +82,6 @@ class TeamAsteroidsEnv(ParallelEnv):
         self.ships: Dict[str, Ship] = {}
         self.asteroids: List[Asteroid] = []
         self.bullets: List[Bullet] = []
-        self.screen = None
-        self.clock = None
         self._cumulative_rewards = {a: 0.0 for a in self.possible_agents}
 
     # ------------------------------------------------------------------ API
@@ -217,8 +217,10 @@ class TeamAsteroidsEnv(ParallelEnv):
             spawns = (cfg.red_spawns if team == RED else cfg.blue_spawns) or []
             idx = int(agent.split("_")[1])
             bp = spawns[idx] if idx < len(spawns) else None
+            # A blueprint with no randomness always proposes the same spot, so retrying is pointless.
+            deterministic = bp is not None and not bp.random_spawn and bp.x_noise == 0 and bp.y_noise == 0
 
-            for _attempt in range(100):
+            for _attempt in range(1 if deterministic else 100):
                 if bp is None or bp.random_spawn:
                     x, y = rng.uniform(0, self.width), rng.uniform(0, self.height)
                     angle = rng.uniform(0, 2 * math.pi)
@@ -259,6 +261,7 @@ class TeamAsteroidsEnv(ParallelEnv):
         cfg = self.config
         ship = self.ships[agent_name]
         thrust, turn, shoot = int(action[0]), int(action[1]), int(action[2])
+        ship.thrusting = thrust == 1
 
         if turn == 1:
             ship.angle -= cfg.turn_speed
@@ -338,8 +341,10 @@ class TeamAsteroidsEnv(ParallelEnv):
                         ast.active = False
                         if ast.size > 1:
                             heading = math.atan2(ast.vel[1], ast.vel[0])
-                            speed = math.hypot(ast.vel[0], ast.vel[1]) * 1.5
-                            for off in (math.pi / 4, -math.pi / 4):
+                            speed = max(math.hypot(ast.vel[0], ast.vel[1]) * self.config.asteroid_split_speedup,
+                                        self.config.asteroid_split_min_speed)
+                            spread = self.config.asteroid_split_spread
+                            for off in (spread, -spread):
                                 new_asteroids.append(Asteroid(
                                     ast.pos[0], ast.pos[1],
                                     math.cos(heading + off) * speed, math.sin(heading + off) * speed,
@@ -417,7 +422,7 @@ class TeamAsteroidsEnv(ParallelEnv):
         cfg = self.config
         S = len(self.possible_agents)
         ships = [self.ships[a] for a in self.possible_agents]
-        L = max(self.width, self.height) / 2
+        L = cfg.sensor_range
         vref = 2 * cfg.max_speed + cfg.bullet_speed
 
         P = np.array([s.pos for s in ships])                   # (S,2)
@@ -601,7 +606,8 @@ class TeamAsteroidsEnv(ParallelEnv):
             if np.isfinite(row).any():
                 j = int(np.argmin(row))
                 aim_q = (1.0 + k["aim_cos"][i, j]) / 2.0
-                range_q = float(np.clip(1.0 - max(0.0, k["dist"][i, j] - 250.0) / 400.0, 0.0, 1.0))
+                range_q = float(np.clip(
+                    1.0 - max(0.0, k["dist"][i, j] - rc.engage_range) / rc.engage_falloff, 0.0, 1.0))
                 phi[i] += rc.aim_weight * aim_q ** 2 + rc.approach_weight * range_q
             threat = 0.0
             for key, tca, miss in (("ast_key", "ast_tca", "ast_miss"), ("bul_key", "bul_tca", "bul_miss")):
@@ -615,55 +621,15 @@ class TeamAsteroidsEnv(ParallelEnv):
     # -------------------------------------------------------------- rendering
 
     def render(self):
+        """Delegate to marl_asteroids.render.Renderer (kept out of the env; purely cosmetic)."""
         if self.render_mode is None:
             return None
-        import pygame
-
-        if self.screen is None:
-            pygame.init()
-            if self.render_mode == "human":
-                pygame.display.init()
-                self.screen = pygame.display.set_mode((int(self.width), int(self.height)))
-            else:
-                self.screen = pygame.Surface((int(self.width), int(self.height)))
-            self.clock = pygame.time.Clock()
-            pygame.font.init()
-            self.font = pygame.font.SysFont("Arial", 14)
-
-        self.screen.fill((0, 0, 0))
-        for ast in self.asteroids:
-            if ast.active:
-                center = (int(ast.pos[0]), int(ast.pos[1]))
-                pygame.draw.circle(self.screen, (150, 150, 150), center, int(ast.radius))
-                pygame.draw.circle(self.screen, (200, 200, 200), center, int(ast.radius), 1)
-        for b in self.bullets:
-            if b.active:
-                color = (255, 140, 120) if b.team_id == RED else (140, 200, 255)
-                pygame.draw.circle(self.screen, color, (int(b.pos[0]), int(b.pos[1])), max(2, int(b.radius)))
-        for name, ship in self.ships.items():
-            if not ship.active:
-                continue
-            color = (255, 50, 50) if ship.team_id == RED else (50, 150, 255)
-            pts = [(int(ship.pos[0] + math.cos(ship.angle + o) * ship.radius * m),
-                    int(ship.pos[1] + math.sin(ship.angle + o) * ship.radius * m))
-                   for o, m in ((0, 1.3), (2.5, 1.0), (-2.5, 1.0))]
-            pygame.draw.polygon(self.screen, color, pts)
-            label = self.font.render(name.split("_")[1], True, color)
-            self.screen.blit(label, (int(ship.pos[0]) + 12, int(ship.pos[1]) - 12))
-        hud = self.font.render(
-            f"frame {self.frame}/{self.config.max_frames}  red {self._team_alive(RED)}  blue {self._team_alive(BLUE)}",
-            True, (200, 200, 200))
-        self.screen.blit(hud, (8, 8))
-
-        if self.render_mode == "human":
-            pygame.event.pump()
-            pygame.display.flip()
-            self.clock.tick(self.metadata["render_fps"])
-            return None
-        return np.transpose(np.array(pygame.surfarray.pixels3d(self.screen)), (1, 0, 2)).copy()
+        if self.renderer is None:
+            from .render import Renderer
+            self.renderer = Renderer(self, **self.render_options)
+        return self.renderer.render(self.render_mode, fps=self.metadata["render_fps"])
 
     def close(self):
-        if self.screen is not None:
-            import pygame
-            pygame.quit()
-            self.screen = None
+        if self.renderer is not None:
+            self.renderer.close()
+            self.renderer = None
