@@ -1,0 +1,17 @@
+Scenario,Blue Agent,Red Agent,Blue Wins,Red Wins,Draws (Time),Draws (Mutual),Blue Win Rate (%),Avg Game Length
+Level 1 (1v1 Open Space),ppo,heuristic_0.25,717,178,8,97,71.7%,235.1
+Level 1 (1v1 Open Space),ppo,heuristic_0.5,647,230,15,108,64.7%,256.1
+Level 1 (1v1 Open Space),ppo,heuristic_0.75,617,310,7,66,61.7%,228.2
+Level 1 (1v1 Open Space),ppo,heuristic_1.0,392,519,12,77,39.2%,232.0
+Level 2 (1v1 w/ 2 Asteroids),ppo,heuristic_0.25,623,297,0,80,62.3%,189.8
+Level 2 (1v1 w/ 2 Asteroids),ppo,heuristic_0.5,547,368,2,83,54.7%,198.2
+Level 2 (1v1 w/ 2 Asteroids),ppo,heuristic_0.75,502,436,0,62,50.2%,195.3
+Level 2 (1v1 w/ 2 Asteroids),ppo,heuristic_1.0,389,553,1,57,38.9%,176.5
+Level 3 (2v2 w/ 2 Asteroids),ppo,heuristic_0.25,591,357,2,50,59.1%,302.1
+Level 3 (2v2 w/ 2 Asteroids),ppo,heuristic_0.5,600,357,5,38,60.0%,317.0
+Level 3 (2v2 w/ 2 Asteroids),ppo,heuristic_0.75,512,454,5,29,51.2%,284.5
+Level 3 (2v2 w/ 2 Asteroids),ppo,heuristic_1.0,444,530,1,25,44.4%,263.6
+Level 4 (3v3 w/ 4 Asteroids),ppo,heuristic_0.25,401,552,5,42,40.1%,325.4
+Level 4 (3v3 w/ 4 Asteroids),ppo,heuristic_0.5,409,552,4,35,40.9%,309.6
+Level 4 (3v3 w/ 4 Asteroids),ppo,heuristic_0.75,409,572,3,16,40.9%,290.1
+Level 4 (3v3 w/ 4 Asteroids),ppo,heuristic_1.0,400,586,2,12,40.0%,264.9

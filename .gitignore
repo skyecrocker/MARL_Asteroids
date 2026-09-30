@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Training artifacts (new runs); legacy checkpoints in models/legacy are tracked
+runs/
+models/*
+!models/legacy/
+
+# Local / unrelated files
+_unrelated/
+.DS_Store
+.vscode/
