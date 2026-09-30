@@ -7,13 +7,12 @@ Examples:
     uv run python scripts/watch.py --scenario demo_team3 --blue a.zip --red b.zip --games 5 --record out.mp4
 """
 from __future__ import annotations
-
 import argparse
 
 import numpy as np
 import pygame
 
-from marl_asteroids.config import SCENARIOS, get_scenario, set_team_fire_rate
+from marl_asteroids.config import SCENARIOS, get_scenario, scale_map, set_team_fire_rate
 from marl_asteroids.env import TeamAsteroidsEnv
 from marl_asteroids.policies import DelayedPolicy, resolve_policy
 
@@ -39,6 +38,10 @@ def main():
     ap.add_argument("--stochastic", action="store_true")
     ap.add_argument("--fps", type=int, default=60)
     ap.add_argument("--window", type=int, default=1000)
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="Grow the arena by this factor (ships/weapons/sensors unchanged)")
+    ap.add_argument("--asteroid-density", type=float, default=1.0,
+                    help="Asteroid count multiplier applied when --scale is used")
     ap.add_argument("--no-effects", action="store_true", help="Disable particles/trails/flames")
     ap.add_argument("--difficulty", choices=sorted(DIFFICULTY), default=None,
                     help="Handicap the non-human side (defaults to 'normal' when one side is human)")
@@ -46,6 +49,10 @@ def main():
     args = ap.parse_args()
 
     cfg = get_scenario(args.scenario)
+    if args.scale != 1.0:
+        cfg = scale_map(cfg, args.scale, asteroid_density=args.asteroid_density)
+        print(f"Arena {cfg.width:.0f}x{cfg.height:.0f}, {cfg.num_asteroids} asteroids, "
+              f"max_frames {cfg.max_frames}")
     team_sizes = {"red": cfg.n_red, "blue": cfg.m_blue}
     # Per-agent specs: one spec applies to the whole team, a comma-separated list assigns per ship
     # (cycled), e.g. --blue human,heuristic_1.0 puts you in blue_0 with an AI wingman.

@@ -77,8 +77,11 @@ def test_ally_slots_exclude_self():
     start = EGO_DIM + cfg.obs_enemies * ENEMY_DIM
     o = env.get_obs("blue_0")
     ally0, ally1 = o[start:start + ALLY_DIM], o[start + ALLY_DIM:start + 2 * ALLY_DIM]
-    assert ally0[0] == 1.0 and ally0[3] > 0.3  # present, 200px away (not self at distance 0)
-    assert np.all(ally1 == 0.0)                 # only one real ally -> second slot padded
+    # Present, and at the real 200px separation rather than self at distance 0
+    assert ally0[0] == 1.0
+    assert ally0[3] == pytest.approx(200 / (200 + cfg.sensor_range), abs=1e-4)
+    assert np.hypot(ally0[1], ally0[2]) == pytest.approx(1.0, abs=1e-4)  # unit bearing
+    assert np.all(ally1 == 0.0)  # only one real ally -> second slot padded
 
 
 def test_teamkill_is_penalized_not_rewarded():

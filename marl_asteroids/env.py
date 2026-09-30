@@ -411,7 +411,8 @@ class TeamAsteroidsEnv(ParallelEnv):
           ego (8): alive, v_fwd, v_lat, cooldown_frac, can_shoot, allies_alive_frac,
                    enemies_alive_frac, time_left_frac
           enemies (k x 15), allies (k x 12), asteroids (k x 9), bullets (k x 10)
-          base slot features (8): present, dx, dy, dist, rel_vx, rel_vy (ego frame),
+          base slot features (8): present, bearing_x, bearing_y (unit vector in the ego frame),
+                   range (dist / (dist + sensor_range)), rel_vx, rel_vy (ego frame),
                    tca, closest_approach_miss
           enemy extras: lead-aim error (cos, sin), intercept time, predicted miss if I fire now,
                    their aim at me (cos), their predicted miss on me if they fire, their cooldown
@@ -447,9 +448,15 @@ class TeamAsteroidsEnv(ParallelEnv):
             tca = np.clip(-(D * RV).sum(-1) / (rv2 + _EPS), 0.0, TCA_HORIZON)
             miss = np.linalg.norm(D + RV * tca[..., None], axis=-1) - (rad[:, None] + rt[None, :])
             Dr, RVr = rot(D), rot(RV)
+            # Bearing as a unit vector plus a saturating range, rather than dx/L and dist/L clipped
+            # to [-1, 1]. Clipping components independently destroys bearing past the normalization
+            # scale (everything far reads as (1, 1)), which made large maps unnavigable. This form
+            # keeps bearing exact at any distance, and range stays monotone: 0.5 at sensor_range,
+            # approaching 1 far away, never fully saturated.
+            inv = 1.0 / (dist + _EPS)
             feats = np.stack([
                 np.ones_like(dist),
-                Dr[..., 0] / L, Dr[..., 1] / L, dist / L,
+                Dr[..., 0] * inv, Dr[..., 1] * inv, dist / (dist + L),
                 RVr[..., 0] / vref, RVr[..., 1] / vref,
                 tca / TCA_HORIZON, np.clip(miss / MISS_SCALE, -1, 1),
             ], axis=-1)

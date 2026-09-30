@@ -80,6 +80,29 @@ Randomized spawns, for training and evaluation:
 | `asteroid_storm` | 2v2 | 10 | dense, fast field |
 | `obstacles` | 2v2 | 5 | indestructible cover |
 
+Larger arenas (ships, weapons, and sensing unchanged, so these are genuinely bigger worlds rather
+than a zoomed-in view):
+
+| Name | Map | Teams | Asteroids |
+|---|---|---|---|
+| `duel_large` | 1600² | 1v1 | 6 |
+| `team2_large` | 1600² | 2v2 | 8 |
+| `team3_large` | 2000² | 3v3 | 15 |
+| `team3_huge` | 3200² | 3v3 | 24 |
+| `demo_team2_large` | 2400² | 2v2 | 4 (static) |
+
+Any scenario can be grown on the fly with `--scale`, which also scales `max_frames` and spawn
+separation, and multiplies the asteroid count (tune with `--asteroid-density`):
+
+```bash
+uv run python scripts/watch.py --scenario team3 --scale 5 --asteroid-density 0.4
+uv run python scripts/evaluate.py --blue model.zip --red heuristic_1.0 --scale 3   # generalization
+```
+
+`scale_map` deliberately does **not** scale `sensor_range`: that length is a tactical scale tied to
+weapon reach (`bullet_speed * bullet_lifespan` is about 480px), not a property of the map. A bigger
+arena therefore means longer approaches and coarser range estimates, not blindness.
+
 Static and mirror-symmetric, for demos, videos, debugging, and human play: `demo_duel`,
 `demo_team2`, `demo_team3`, `demo_open`. These use a 1200x1200 map with proportionally larger ships,
 teams spawn perpendicular to each other (so both must turn to engage), and the layout is exactly
@@ -102,12 +125,18 @@ Scripted opponents: `dummy`, `evasion_easy`, `evasion`, `heuristic_<p>` (acts wi
   are indestructible cover that absorbs shots.
 - Observation (209-d, ego ship's heading frame, clipped to [-1, 1]): ego state plus k-nearest
   enemies (3), allies excluding self (2), asteroids (8), and bullets that can hurt the ego (6).
-  Each slot has a presence flag, relative position/velocity, closest-approach time and miss
-  distance. Enemies add the lead-aim intercept direction, the predicted miss if I fire now, and
-  whether they are aiming at me. Allies add their heading and my predicted friendly-fire miss.
-- **Distances are normalized by `sensor_range` (a fixed length), not by map size**, so the world can
-  be resized without changing what the policy sees, and the same field is the natural hook for real
+  Each slot has a presence flag, **bearing as a unit vector**, a **saturating range**
+  (`dist / (dist + sensor_range)`, so 0.5 exactly at `sensor_range`), relative velocity,
+  closest-approach time and miss distance. Enemies add the lead-aim intercept direction, the
+  predicted miss if I fire now, and whether they are aiming at me. Allies add their heading and my
+  predicted friendly-fire miss.
+- **Lengths are normalized by `sensor_range` (a fixed length), not by map size**, so the world can be
+  resized without changing what the policy sees, and the same field is the natural hook for real
   limited-range sensors later. Verified by test across 800 / 1600 / 4000 maps.
+- Bearing is a unit vector and range saturates smoothly, rather than clipping `dx`/`dy` to
+  [-1, 1] independently. Clipping components destroyed bearing past the normalization scale: every
+  distant object read as `(1, 1)`, so objects at 20°, 45°, and 70° were indistinguishable and large
+  maps were unnavigable.
 - Reward (`RewardConfig`): kill +1, death -1, team kill -1 (shooter); mixed across the team by
   `team_spirit`; shared win/loss at the end, also delivered to teammates who already died; plus
   potential-based shaping (aim, range, hazard), which cannot change the optimal policy.

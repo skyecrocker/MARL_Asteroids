@@ -187,6 +187,42 @@ _DEMO_ROCKS = [
     (DEMO_W * 0.68, DEMO_H * 0.5, -0.3, 0.0, 2),
 ]
 
+def scale_map(config: GameConfig, factor: float, asteroid_density: float = 1.0,
+              **overrides) -> GameConfig:
+    """Grow the arena by ``factor`` while keeping ships, weapons, and sensing unchanged.
+
+    Scales the map, the truncation limit (travel time grows roughly linearly with size), and spawn
+    separation. Asteroid count scales as ``factor * asteroid_density``: preserving true density would
+    need ``factor**2``, which gets expensive and chaotic fast, so the default thins the field out.
+
+    Deliberately does NOT scale ``sensor_range``. That length is a tactical scale tied to weapon
+    reach (bullet_speed * bullet_lifespan is about 480 px), not a property of the map. Bearing to
+    every tracked object stays exact at any distance, so a bigger arena means longer approaches with
+    coarser range estimates rather than blindness.
+    """
+    def scale_spawns(spawns: List[EntityState]) -> List[EntityState]:
+        # Positions are absolute, so they must scale with the map or a static layout drifts into a
+        # corner and loses its symmetry. Velocities are physics and stay as they are.
+        return [dataclasses.replace(bp, x=bp.x * factor, y=bp.y * factor,
+                                    x_noise=bp.x_noise * factor, y_noise=bp.y_noise * factor)
+                for bp in spawns]
+
+    asteroid_spawns = scale_spawns(config.asteroid_spawns or [])
+    return config.replace(
+        width=config.width * factor,
+        height=config.height * factor,
+        max_frames=int(config.max_frames * factor),
+        min_spawn_dist=config.min_spawn_dist * factor,
+        # Never drop below the explicitly placed rocks, so static layouts stay static.
+        num_asteroids=max(round(config.num_asteroids * factor * asteroid_density),
+                          len(asteroid_spawns)),
+        red_spawns=scale_spawns(config.red_spawns or []),
+        blue_spawns=scale_spawns(config.blue_spawns or []),
+        asteroid_spawns=asteroid_spawns,
+        **overrides,
+    )
+
+
 SCENARIOS: Dict[str, GameConfig] = {
     # --- Training / evaluation (randomized spawns) ---
     "duel": GameConfig(n_red=1, m_blue=1, num_asteroids=0),
@@ -209,6 +245,18 @@ SCENARIOS: Dict[str, GameConfig] = {
                                asteroids_split=True, **DEMO_SCALE),
     "demo_open": static_battle(1, DEMO_W, DEMO_H, **DEMO_SCALE),
 }
+
+# --- Larger arenas: longer approaches, more room to maneuver and disengage ---
+# Ship, weapon, and sensor scales are unchanged, so these are genuinely bigger worlds rather than a
+# zoomed-in view. Useful for human play (more reaction time) and as a robustness check.
+SCENARIOS.update({
+    "duel_large": scale_map(SCENARIOS["duel_rocks"], 2.0),          # 1600x1600
+    "team2_large": scale_map(SCENARIOS["team2"], 2.0),              # 1600x1600
+    "team3_large": scale_map(SCENARIOS["team3"], 2.5),              # 2000x2000
+    "team3_huge": scale_map(SCENARIOS["team3"], 4.0),               # 3200x3200
+    # asteroid_density=0 keeps exactly the 4 placed rocks, so the layout stays fully deterministic.
+    "demo_team2_large": scale_map(SCENARIOS["demo_team2"], 2.0, asteroid_density=0.0),  # 2400x2400
+})
 
 # Evaluation suite mirroring the legacy report's levels 1-4.
 EVAL_SCENARIOS: Dict[str, str] = {

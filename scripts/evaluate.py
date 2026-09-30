@@ -19,7 +19,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import torch as th
 
-from marl_asteroids.config import EVAL_SCENARIOS, SCENARIOS, get_scenario
+from marl_asteroids.config import EVAL_SCENARIOS, SCENARIOS, get_scenario, scale_map
 from marl_asteroids.matches import play_matches, play_matches_mirrored
 from marl_asteroids.policies import resolve_policy
 
@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--stochastic", action="store_true", help="Sample network actions instead of argmax")
     ap.add_argument("--no-mirror", action="store_true",
                     help="Disable mirrored (color-swapped) evaluation; mirroring removes spawn bias")
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="Grow the arena by this factor (generalization check)")
     ap.add_argument("--out", default=None, help="CSV path")
     args = ap.parse_args()
     th.set_num_threads(4)
@@ -48,6 +50,8 @@ def main():
                 blue = resolve_policy(b, seed=args.seed, deterministic=not args.stochastic)
                 red = resolve_policy(r, seed=args.seed + 1, deterministic=not args.stochastic)
                 cfg = get_scenario(scenario)
+                if args.scale != 1.0:
+                    cfg = scale_map(cfg, args.scale)
                 mirror = not args.no_mirror and cfg.n_red == cfg.m_blue
                 runner = play_matches_mirrored if mirror else play_matches
                 stats = runner(cfg, blue, red, args.games, n_parallel=args.parallel, seed=args.seed)

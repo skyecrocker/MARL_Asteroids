@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from marl_asteroids.config import (EntityState, GameConfig, SCENARIOS, get_scenario,
-                                   set_team_fire_rate, static_battle)
+                                   scale_map, set_team_fire_rate, static_battle)
 from marl_asteroids.env import BLUE, RED, TeamAsteroidsEnv
 from marl_asteroids.matches import play_matches, play_matches_mirrored
 from marl_asteroids.policies import DelayedPolicy, Policy, make_scripted
@@ -43,9 +43,9 @@ def test_sensor_range_sets_the_distance_scale():
     _setup(env, {"blue_0": (100, 100, 0.0), "red_0": (300, 100, 0.0)})
     o = env.get_obs("blue_0")
     from marl_asteroids.env import EGO_DIM
-    dx, dist = o[EGO_DIM + 1], o[EGO_DIM + 3]
-    assert dx == pytest.approx(200 / 400.0)
-    assert dist == pytest.approx(200 / 400.0)
+    bearing_x, rng = o[EGO_DIM + 1], o[EGO_DIM + 3]
+    assert bearing_x == pytest.approx(1.0)          # unit bearing, straight ahead
+    assert rng == pytest.approx(200 / (200 + 400))  # saturating range, 0.5 at sensor_range
 
 
 # ------------------------------------------------------------- mirrored evaluation
@@ -240,3 +240,87 @@ def test_thrusting_flag_tracks_commanded_thrust():
     env.reset(seed=0)
     env.step({"red_0": [1, 0, 0], "blue_0": [0, 0, 0]})
     assert env.ships["red_0"].thrusting and not env.ships["blue_0"].thrusting
+
+
+# ------------------------------------------------------- large maps / scaling
+
+
+def test_bearing_survives_beyond_sensor_range():
+    """Past sensor_range the range feature saturates, but bearing must stay exact and distinct."""
+    from marl_asteroids.env import EGO_DIM
+    cfg = get_scenario("duel", width=4000.0, height=4000.0)
+
+    def probe(bearing_deg, dist):
+        env = TeamAsteroidsEnv(cfg)
+        env.reset(seed=0)
+        b = math.radians(bearing_deg)
+        _setup(env, {"blue_0": (2000, 2000, 0.0),
+                     "red_0": (2000 + math.cos(b) * dist, 2000 + math.sin(b) * dist, 0.0)})
+        return env.get_obs("blue_0")[EGO_DIM:EGO_DIM + 4]
+
+    for dist in (300, 900, 2000):
+        feats = {bd: probe(bd, dist) for bd in (20, 45, 70)}
+        for bd, f in feats.items():
+            # unit bearing vector, exact at any range
+            assert np.hypot(f[1], f[2]) == pytest.approx(1.0, abs=1e-4)
+            assert math.degrees(math.atan2(f[2], f[1])) == pytest.approx(bd, abs=0.5)
+        bearings = [tuple(np.round(f[1:3], 4)) for f in feats.values()]
+        assert len(set(bearings)) == 3, f"bearings collapsed at {dist}px"
+
+
+def test_range_feature_is_monotone_and_never_saturates():
+    from marl_asteroids.env import EGO_DIM
+    cfg = get_scenario("duel", width=8000.0, height=8000.0, sensor_range=500.0)
+    vals = []
+    for dist in (100, 500, 1000, 3000):
+        env = TeamAsteroidsEnv(cfg)
+        env.reset(seed=0)
+        _setup(env, {"blue_0": (4000, 4000, 0.0), "red_0": (4000 + dist, 4000, 0.0)})
+        vals.append(env.get_obs("blue_0")[EGO_DIM + 3])
+    assert all(a < b for a, b in zip(vals, vals[1:])), vals
+    assert vals[1] == pytest.approx(0.5)  # 0.5 exactly at sensor_range
+    assert vals[-1] < 1.0
+
+
+def test_scale_map_scales_geometry_not_ships():
+    base = get_scenario("team2")
+    big = scale_map(base, 3.0)
+    assert (big.width, big.height) == (base.width * 3, base.height * 3)
+    assert big.max_frames == int(base.max_frames * 3)
+    assert big.min_spawn_dist == base.min_spawn_dist * 3
+    assert big.num_asteroids == round(base.num_asteroids * 3)
+    # ships, weapons and sensing are untouched: a genuinely bigger world, not a zoom
+    for field in ("ship_radius", "max_speed", "bullet_speed", "fire_rate", "sensor_range"):
+        assert getattr(big, field) == getattr(base, field)
+
+
+def test_scale_map_keeps_static_layouts_symmetric():
+    big = scale_map(get_scenario("demo_team2"), 2.0, asteroid_density=0.0)
+    env = TeamAsteroidsEnv(big)
+    env.reset(seed=0)
+    w, h = big.width, big.height
+    assert big.num_asteroids == len(big.asteroid_spawns) == 4  # still fully deterministic
+    reds = sorted(tuple(np.round(env.ships[f"red_{i}"].pos, 6)) for i in range(big.n_red))
+    blues = sorted(tuple(np.round(((w - env.ships[f"blue_{i}"].pos[0]) % w,
+                                  (h - env.ships[f"blue_{i}"].pos[1]) % h), 6))
+                   for i in range(big.m_blue))
+    assert reds == blues
+    # spawns really did move out with the map rather than clustering near the origin
+    assert all(env.ships[a].pos.max() > big.width * 0.25 for a in cfg_agents(big))
+
+
+@pytest.mark.parametrize("name", ["duel_large", "team2_large", "team3_large", "team3_huge",
+                                  "demo_team2_large"])
+def test_large_scenarios_are_playable(name):
+    cfg = get_scenario(name)
+    assert cfg.width > 1200
+    stats = play_matches(cfg, make_scripted("heuristic_1.0", 0), make_scripted("heuristic_1.0", 1),
+                         4, n_parallel=4, seed=0)
+    assert stats.games == 4
+    assert sum(stats.kills.values()) > 0, "bots cannot find each other on this map"
+
+
+def test_static_large_scenario_is_still_symmetric():
+    stats = play_matches(get_scenario("demo_team2_large"), make_scripted("heuristic_1.0"),
+                         make_scripted("heuristic_1.0"), 2, n_parallel=2, seed=0)
+    assert stats.blue_wins == 0 and stats.red_wins == 0
