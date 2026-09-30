@@ -1,553 +1,669 @@
-import gymnasium as gym
-from pettingzoo.utils.env import ParallelEnv
+"""Team Asteroids: red vs. blue multi-agent environment (PettingZoo ParallelEnv).
+
+Key properties
+- Toroidal map, discrete actions ``MultiDiscrete([2, 3, 2])`` = (thrust, turn, shoot).
+- Each agent decision is repeated for ``config.action_repeat`` physics frames.
+- Episode ends when a team is eliminated (termination) or at ``config.max_frames`` (truncation).
+- Observations are ego-centric (rotated into the ship's heading frame), normalized to [-1, 1],
+  with k-nearest slots for enemies, allies (excluding self), asteroids, and hazardous bullets.
+- Rewards are computed for *all* possible agents each step (``self.rewards_all``) so that a
+  training harness can deliver the team outcome to agents that died earlier. The PettingZoo
+  ``step`` return only contains agents that were alive at the start of the step.
+"""
+from __future__ import annotations
+
 import math
+from typing import Dict, List, Optional, Tuple
+
+import gymnasium as gym
 import numpy as np
-import pygame
-import random
-from .entities import Ship, Asteroid, Bullet
+from pettingzoo.utils.env import ParallelEnv
+
 from .config import GameConfig
+from .entities import Asteroid, Bullet, Ship
+
+RED, BLUE = 0, 1
+TEAM_NAMES = ("red", "blue")
+
+# Per-slot feature widths (see _compute_obs for the layout)
+EGO_DIM = 8
+BASE_DIM = 8
+ENEMY_DIM = BASE_DIM + 7
+ALLY_DIM = BASE_DIM + 4
+ASTEROID_DIM = BASE_DIM + 1
+BULLET_DIM = BASE_DIM + 2
+
+_EPS = 1e-8
+TCA_HORIZON = 90.0   # frames; time-to-closest-approach normalization
+MISS_SCALE = 200.0   # px; closest-approach miss distance normalization
+SHOT_SCALE = 50.0    # px; predicted shot miss distance normalization
+
+
+def obs_dim(config: GameConfig) -> int:
+    return (EGO_DIM
+            + config.obs_enemies * ENEMY_DIM
+            + config.obs_allies * ALLY_DIM
+            + config.obs_asteroids * ASTEROID_DIM
+            + config.obs_bullets * BULLET_DIM)
 
 
 class TeamAsteroidsEnv(ParallelEnv):
-    metadata = {"render_modes": ["human", "rgb_array"], "name": "team_asteroids_v0"}
+    metadata = {"render_modes": ["human", "rgb_array"], "name": "team_asteroids_v1", "render_fps": 60}
 
-    def __init__(self, config: GameConfig):
+    def __init__(self, config: GameConfig, render_mode: Optional[str] = None):
         self.config = config
+        self.render_mode = render_mode
         self.n_red = config.n_red
         self.m_blue = config.m_blue
-        self.num_asteroids = config.num_asteroids
-
+        self.width = float(config.width)
+        self.height = float(config.height)
         self.friendly_fire = config.friendly_fire
         self.asteroids_split = config.asteroids_split
 
-        self.width = config.width
-        self.height = config.height
-        
-        # Define agents
         self.possible_agents = [f"red_{i}" for i in range(self.n_red)] + \
                                [f"blue_{i}" for i in range(self.m_blue)]
-        
-        self._cumulative_rewards = {agent: 0.0 for agent in self.possible_agents}
+        self.agent_index = {a: i for i, a in enumerate(self.possible_agents)}
+        self.team_of = {a: (RED if a.startswith("red") else BLUE) for a in self.possible_agents}
+        self.team_agents = {
+            RED: [a for a in self.possible_agents if self.team_of[a] == RED],
+            BLUE: [a for a in self.possible_agents if self.team_of[a] == BLUE],
+        }
 
-        # We will define the spaces in a helper method
-        self.observation_spaces = {agent: self._get_obs_space() for agent in self.possible_agents}
-        self.action_spaces = {agent: self._get_action_space() for agent in self.possible_agents}
+        self._obs_dim = obs_dim(config)
+        self._obs_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self._obs_dim,), dtype=np.float32)
+        self._act_space = gym.spaces.MultiDiscrete([2, 3, 2])
+        self.observation_spaces = {a: self._obs_space for a in self.possible_agents}
+        self.action_spaces = {a: self._act_space for a in self.possible_agents}
+
+        self.np_random = np.random.default_rng()
+        self.agents: List[str] = []
+        self.ships: Dict[str, Ship] = {}
+        self.asteroids: List[Asteroid] = []
+        self.bullets: List[Bullet] = []
+        self.screen = None
+        self.clock = None
+        self._cumulative_rewards = {a: 0.0 for a in self.possible_agents}
+
+    # ------------------------------------------------------------------ API
+
+    def observation_space(self, agent):
+        return self.observation_spaces[agent]
+
+    def action_space(self, agent):
+        return self.action_spaces[agent]
 
     def reset(self, seed=None, options=None):
-        
+        if seed is not None:
+            self.np_random = np.random.default_rng(seed)
         self.agents = self.possible_agents[:]
-        self.ships = {}
-        
-        # --- NEW: Minimum Safe Distance ---
-        MIN_SPAWN_DIST = 150.0  # Minimum pixels between ships. Adjust this!
-        MAX_ATTEMPTS = 50       # Don't get stuck in an infinite loop
-        
-        # 1. Spawn Ships
-        for agent in self.agents:
-            team_id = 0 if "red" in agent else 1
-            spawns = self.config.red_spawns if team_id == 0 else self.config.blue_spawns
-            
-            # SAFEGUARD: Treat None as an empty list
-            if spawns is None:
-                spawns = []
-            
-            # Extract the agent index
-            agent_idx = int(agent.split("_")[1])
-            
-            valid_spawn = False
-            attempts = 0
-            
-            # Keep rolling the dice until we find a safe spot (or run out of attempts)
-            while not valid_spawn and attempts < MAX_ATTEMPTS:
-                
-                # Propose coordinates
-                if agent_idx < len(spawns):
-                    bp = spawns[agent_idx]
-                    if bp.random_spawn:
-                        x = np.random.uniform(0, self.width)
-                        y = np.random.uniform(0, self.height)
-                        angle = np.random.uniform(0, 2 * math.pi)
-                    else:
-                        x = np.random.normal(bp.x, bp.x_noise) % self.width
-                        y = np.random.normal(bp.y, bp.y_noise) % self.height
-                        angle = np.random.normal(bp.angle, bp.angle_noise)
-                else:
-                    x = np.random.uniform(0, self.width)
-                    y = np.random.uniform(0, self.height)
-                    angle = np.random.uniform(0, 2 * math.pi)
+        self.frame = 0
+        self.decision_step = 0
+        self.winner: Optional[int] = None  # RED, BLUE, or -1 for draw once the game ends
+        self.game_over = False
+        self.kill_log: List[Tuple[str, str]] = []
+        self._cumulative_rewards = {a: 0.0 for a in self.possible_agents}
 
-                # Check proposed (x, y) against all ALREADY placed ships
-                too_close = False
-                for placed_ship in self.ships.values():
-                    # Wrapped distance math (vital for Asteroids-style maps)
-                    dx = min(abs(x - placed_ship.pos[0]), self.width - abs(x - placed_ship.pos[0]))
-                    dy = min(abs(y - placed_ship.pos[1]), self.height - abs(y - placed_ship.pos[1]))
-                    dist = math.hypot(dx, dy)
-                    
-                    if dist < MIN_SPAWN_DIST:
-                        too_close = True
-                        break # Break the inner loop, this spot is dead, try again
-                
-                if not too_close:
-                    valid_spawn = True # We found a safe spot!
-                    
-                attempts += 1
-
-            # --- Now instantiate the ship at the valid coordinates ---
-            if agent_idx < len(spawns):
-                bp = spawns[agent_idx]
-                ship = Ship(x, y, team_id, agent, fire_rate=bp.fire_rate)
-                ship.vel[0] = np.random.normal(bp.vx, bp.vx_noise)
-                ship.vel[1] = np.random.normal(bp.vy, bp.vy_noise)
-                ship.angle = angle
-            else:
-                # Fallback TRUE random ship
-                ship = Ship(x, y, team_id, agent)
-                ship.angle = angle
-                
-            self.ships[agent] = ship
-
-        # 2. Spawn Asteroids
-        self.asteroids = []
-        
-        # --- SAFEGUARD: Treat None as an empty list ---
-        ast_spawns = self.config.asteroid_spawns if self.config.asteroid_spawns is not None else []
-        
-        # First, spawn explicitly defined asteroids
-        for bp in ast_spawns:
-            x = np.random.normal(bp.x, bp.x_noise) % self.width
-            y = np.random.normal(bp.y, bp.y_noise) % self.height
-            vx = np.random.normal(bp.vx, bp.vx_noise)
-            vy = np.random.normal(bp.vy, bp.vy_noise)
-            
-            self.asteroids.append(Asteroid(x, y, vx, vy, size=bp.size))
-            
-        # Second, fill the remaining required num_asteroids with random spawns
-        asteroids_needed = self.config.num_asteroids - len(ast_spawns)
-        for _ in range(max(0, asteroids_needed)):
-            safe = False
-            while not safe:
-                ax = np.random.uniform(0, self.width)
-                ay = np.random.uniform(0, self.height)
-                safe = True
-                for ship in self.ships.values():
-                    # Standard distance check for safe spawning
-                    dist = math.hypot(ax - ship.pos[0], ay - ship.pos[1])
-                    if dist < 100.0:  
-                        safe = False
-                        break
-            
-            angle = np.random.uniform(0, 2 * math.pi)
-            speed = np.random.uniform(0.5, 1.5)
-            vx = math.cos(angle) * speed
-            vy = math.sin(angle) * speed
-            self.asteroids.append(Asteroid(ax, ay, vx, vy, size=3))
-
+        self._spawn_ships()
+        self._spawn_asteroids()
         self.bullets = []
-        
-        # Return initial observations
-        observations = {agent: self._get_obs(agent) for agent in self.agents}
-        infos = {agent: {} for agent in self.agents}
+
+        self._compute_obs()
+        self._phi = self._potentials()
+        self.rewards_all = {a: 0.0 for a in self.possible_agents}
+
+        observations = {a: self._obs[self.agent_index[a]].copy() for a in self.agents}
+        infos = {a: {} for a in self.agents}
+        if self.render_mode == "human":
+            self.render()
         return observations, infos
 
     def step(self, actions):
-        # 1. Apply Actions (Thrust, Turn, Shoot)
-        for agent, action in actions.items():
-            self._apply_action(agent, action)
-            
-        # 2. Physics Step
-        self._step_physics()
-        
-        # 3. Collision Detection 
-        # (Modify this function to return who killed who, e.g., a list of tuples: [("blue_0", "red_0")])
-        kill_events = self._resolve_collisions() 
-        
-        # 4. Calculate Rewards & Dones
-        rewards = {agent: 0.0 for agent in self.agents}
-        terminations = {agent: False for agent in self.agents}
-        truncations = {agent: False for agent in self.agents}
-        infos = {agent: {} for agent in self.agents}
-        
-        # --- THE MISSING SYNCHRONIZATION LOGIC ---
-        
-        # A. Process the kills from the collision step
-        if kill_events:
-            for shooter, victim in kill_events:
-                if shooter in rewards:
-                    rewards[shooter] += 1.0  # Base kill reward! (Wrapper multiplies this by 1000)
-                if victim in rewards:
-                    rewards[victim] -= 1.0   # Base death penalty
-        
-        # B. Sync the terminations with the physical ship state
-        for agent in self.agents:
-            # Assuming you store ship objects in a self.ships dictionary
-            ship = self.ships[agent] 
-            
-            # If the collision logic marked the ship as dead
-            if not ship.active:  
-                terminations[agent] = True
-        
-        # -----------------------------------------
-        
-        # Generate the observation array for everyone currently alive (The Eyes!)
-        observations = {agent: self._get_obs(agent) for agent in self.agents}
-        
-        self._latest_rewards = rewards.copy()
+        cfg = self.config
+        rcfg = cfg.rewards
+        alive_before = self.agents[:]
+        ind = {a: 0.0 for a in self.possible_agents}
 
-        # Remove dead agents from self.agents (No more zombies!)
-        self.agents = [agent for agent in self.agents if not terminations[agent]]
-        
+        for _ in range(cfg.action_repeat):
+            for agent in alive_before:
+                if agent in actions and self.ships[agent].active:
+                    self._apply_action(agent, actions[agent])
+            self._step_physics()
+            events = self._resolve_collisions()
+            self.frame += 1
+            for shooter, victim in events:
+                self.kill_log.append((shooter, victim))
+                ind[victim] += rcfg.death
+                if shooter in self.ships:
+                    if self.team_of[shooter] == self.team_of[victim]:
+                        ind[shooter] += rcfg.teamkill
+                    else:
+                        ind[shooter] += rcfg.kill
+            if self.render_mode == "human":
+                self.render()
+            if self._team_alive(RED) == 0 or self._team_alive(BLUE) == 0 or self.frame >= cfg.max_frames:
+                break
+        self.decision_step += 1
+
+        red_alive, blue_alive = self._team_alive(RED), self._team_alive(BLUE)
+        terminated = red_alive == 0 or blue_alive == 0
+        truncated = (not terminated) and self.frame >= cfg.max_frames
+        self.game_over = terminated or truncated
+
+        # Observations + potential-based shaping (phi of dead agents / terminal states is 0)
+        self._compute_obs()
+        phi_new = self._potentials() if not self.game_over else np.zeros(len(self.possible_agents))
+        for agent in alive_before:
+            i = self.agent_index[agent]
+            new = phi_new[i] if self.ships[agent].active else 0.0
+            ind[agent] += rcfg.shaping_scale * (rcfg.shaping_gamma * new - self._phi[i])
+        self._phi = phi_new
+
+        # Team-spirit mixing over the full roster, then the shared outcome
+        rewards_all = {}
+        for team in (RED, BLUE):
+            members = self.team_agents[team]
+            if not members:
+                continue
+            mean = sum(ind[a] for a in members) / len(members)
+            for a in members:
+                rewards_all[a] = (1 - rcfg.team_spirit) * ind[a] + rcfg.team_spirit * mean
+        if self.game_over:
+            if terminated and red_alive == 0 and blue_alive > 0:
+                self.winner = BLUE
+            elif terminated and blue_alive == 0 and red_alive > 0:
+                self.winner = RED
+            else:
+                self.winner = -1
+            for a in self.possible_agents:
+                if self.winner == -1:
+                    rewards_all[a] += rcfg.draw
+                elif self.team_of[a] == self.winner:
+                    rewards_all[a] += rcfg.win
+                else:
+                    rewards_all[a] += rcfg.loss
+        self.rewards_all = rewards_all
+        for a, r in rewards_all.items():
+            self._cumulative_rewards[a] += r
+
+        observations, rewards, terminations, truncations, infos = {}, {}, {}, {}, {}
+        for agent in alive_before:
+            i = self.agent_index[agent]
+            dead = not self.ships[agent].active
+            observations[agent] = self._obs[i].copy()
+            rewards[agent] = rewards_all[agent]
+            terminations[agent] = dead or terminated
+            truncations[agent] = (not dead) and truncated
+            infos[agent] = {}
+            if self.game_over:
+                infos[agent]["winner"] = self.winner
+
+        if self.game_over:
+            self.agents = []
+        else:
+            self.agents = [a for a in alive_before if self.ships[a].active]
         return observations, rewards, terminations, truncations, infos
 
-    def render(self):
-        if self.render_mode is None:
-            return
+    def get_obs(self, agent: str) -> np.ndarray:
+        """Latest observation for an agent (zeros if dead)."""
+        return self._obs[self.agent_index[agent]].copy()
 
-        # 1. Initialize PyGame lazily
-        if not hasattr(self, 'screen') or self.screen is None:
-            pygame.init()
-            pygame.display.init()
-            self.screen = pygame.display.set_mode((int(self.width), int(self.height)))
-            self.clock = pygame.time.Clock()
+    # --------------------------------------------------------------- spawning
 
-        # 2. Clear Screen (Black space)
-        self.screen.fill((0, 0, 0))
+    def _spawn_ships(self):
+        cfg, rng = self.config, self.np_random
+        self.ships = {}
+        for agent in self.possible_agents:
+            team = self.team_of[agent]
+            spawns = (cfg.red_spawns if team == RED else cfg.blue_spawns) or []
+            idx = int(agent.split("_")[1])
+            bp = spawns[idx] if idx < len(spawns) else None
 
-        # 3. Draw Asteroids (Grey circles)
-        for ast in self.asteroids:
-            if ast.active:
-                pygame.draw.circle(self.screen, (150, 150, 150), (int(ast.pos[0]), int(ast.pos[1])), int(ast.radius))
-                # Draw a slight outline for style
-                pygame.draw.circle(self.screen, (200, 200, 200), (int(ast.pos[0]), int(ast.pos[1])), int(ast.radius), 1)
-
-        # 4. Draw Bullets (Yellow circles)
-        for bullet in self.bullets:
-            if bullet.active:
-                pygame.draw.circle(self.screen, (255, 255, 0), (int(bullet.pos[0]), int(bullet.pos[1])), int(bullet.radius))
-
-        # 5. Draw Ships (Triangles indicating heading)
-        if not hasattr(self, 'debug_font'):
-            pygame.font.init()
-            # You can change the size (18) to fit your screen better
-            self.debug_font = pygame.font.SysFont('Arial', 18)
-
-
-        for agent_name, ship in self.ships.items():
-            if not ship.active:
-                continue
-            
-            # Color based on team
-            color = (255, 50, 50) if ship.team_id == 0 else (50, 150, 255)
-            
-            # Calculate triangle points based on heading angle (cast to int for PyGame)
-            tip = (int(ship.pos[0] + math.cos(ship.angle) * ship.radius),
-                   int(ship.pos[1] + math.sin(ship.angle) * ship.radius))
-            
-            left = (int(ship.pos[0] + math.cos(ship.angle + 2.5) * ship.radius),
-                    int(ship.pos[1] + math.sin(ship.angle + 2.5) * ship.radius))
-            
-            right = (int(ship.pos[0] + math.cos(ship.angle - 2.5) * ship.radius),
-                     int(ship.pos[1] + math.sin(ship.angle - 2.5) * ship.radius))
-            
-            pygame.draw.polygon(self.screen, color, [tip, left, right])
-
-            # <--- NEW: Draw the Cumulative Wrapper Rewards --->
-            if hasattr(self, '_cumulative_rewards') and agent_name in self._cumulative_rewards:
-                cum_rew = self._cumulative_rewards[agent_name]
-                
-                # Format to 1 decimal place (e.g., "+100.5", "-45.0")
-                color = (0, 255, 0) if cum_rew >= 0 else (255, 100, 100)
-                text_surface = self.debug_font.render(f"Total: {cum_rew:+.1f}", True, color)
-                
-                # Offset by 20 pixels and force standard integers
-                text_x = int(ship.pos[0]) + 20
-                text_y = int(ship.pos[1]) - 20
-                
-                #self.screen.blit(text_surface, (text_x, text_y))
-
-
-        # 6. Update display and tick clock (60 FPS)
-        if self.render_mode == "human":
-            pygame.event.pump() # Keep OS from thinking window is frozen
-            pygame.display.flip()
-            self.clock.tick(60)
-            
-    def close(self):
-        if hasattr(self, 'screen') and self.screen is not None:
-            pygame.quit()
-            self.screen = None
-
-    # --- Helper Methods ---
-    
-    def _get_obs_space(self):
-        # Ego(5) + 5 Ast(40) + 3 Enemies(24) + 2 Allys(16) + 3 Bullets(24) = 109 dimensions
-        # We use a Box space bounds from -1 to 1 (normalized)
-        return gym.spaces.Box(low=-1.0, high=1.0, shape=(109,), dtype=np.float32)
-
-    def _get_obs(self, agent_name):
-        ego = self.ships[agent_name]
-        
-        # If the ship is dead, return an array of zeros to maintain shape
-        if not ego.active:
-            return np.zeros(109, dtype=np.float32)
-
-        # 1. Ego State (Normalized)
-        max_speed = self.config.max_speed
-        obs = [
-            ego.vel[0] / max_speed,
-            ego.vel[1] / max_speed,
-            math.cos(ego.angle),
-            math.sin(ego.angle),
-            ego.cooldown / ego.fire_rate, # Max cooldown
-        ]
-
-        # --- Helper for padding/sorting K-nearest ---
-        def get_k_nearest(entities, k):
-            entity_data = []
-            for ent in entities:
-                is_enemy = 1.0 if isinstance(ent, Ship) and ent.team_id != ego.team_id else 0.0
-                is_ally = 1.0 if isinstance(ent, Ship) and ent.team_id == ego.team_id else 0.0
-                is_asteroid = 1.0 if isinstance(ent, Asteroid) else 0.0
-                is_bullet = 1.0 if isinstance(ent, Bullet) else 0.0
-
-                dx, dy, dist = self._get_relative_wrapped_distance(ego.pos, ent.pos)
-                entity_data.append({
-                    'dist': dist,
-                    'data': [
-                        dx / (self.width / 2),  # Normalize to roughly [-1, 1]
-                        dy / (self.height / 2),
-                        ent.vel[0] / max_speed,
-                        ent.vel[1] / max_speed,
-                        is_enemy,
-                        is_ally,
-                        is_asteroid,
-                        is_bullet
-                    ]
-                })
-            
-            # Sort by distance
-            entity_data.sort(key=lambda x: x['dist'])
-            
-            # Extract the top K data arrays
-            flat_data = []
-            for i in range(k):
-                if i < len(entity_data):
-                    flat_data.extend(entity_data[i]['data'])
+            for _attempt in range(100):
+                if bp is None or bp.random_spawn:
+                    x, y = rng.uniform(0, self.width), rng.uniform(0, self.height)
+                    angle = rng.uniform(0, 2 * math.pi)
                 else:
-                    # Pad with zeros if fewer than K objects exist
-                    flat_data.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            return flat_data
+                    x = rng.normal(bp.x, bp.x_noise) % self.width
+                    y = rng.normal(bp.y, bp.y_noise) % self.height
+                    angle = rng.normal(bp.angle, bp.angle_noise)
+                if all(self._wrapped_dist((x, y), s.pos) >= cfg.min_spawn_dist for s in self.ships.values()):
+                    break
 
-        # 2. Extract active entities
-        active_asteroids = [ast for ast in self.asteroids if ast.active]
-        active_enemies = [s for name, s in self.ships.items() if s.active and s.team_id != ego.team_id]
-        active_allies = [s for name, s in self.ships.items() if s.active and s.team_id == ego.team_id]
-        
-        # We only care about bullets that don't belong to our team (if friendly fire is off)
-        # or just all active bullets if we want to dodge everything.
-        active_bullets = [b for b in self.bullets if b.active and (self.friendly_fire or b.team_id != ego.team_id)]
+            ship = Ship(x, y, team, agent, cfg, fire_rate=bp.fire_rate if bp else None)
+            ship.angle = angle
+            if bp is not None:
+                ship.vel[:] = (rng.normal(bp.vx, bp.vx_noise), rng.normal(bp.vy, bp.vy_noise))
+            self.ships[agent] = ship
 
-        # 3. Append to observation
-        obs.extend(get_k_nearest(active_asteroids, k=5))
-        obs.extend(get_k_nearest(active_enemies, k=3))
-        obs.extend(get_k_nearest(active_bullets, k=3))
-        obs.extend(get_k_nearest(active_allies, k=2))
+    def _spawn_asteroids(self):
+        cfg, rng = self.config, self.np_random
+        self.asteroids = []
+        for bp in cfg.asteroid_spawns or []:
+            x = rng.normal(bp.x, bp.x_noise) % self.width
+            y = rng.normal(bp.y, bp.y_noise) % self.height
+            vx, vy = rng.normal(bp.vx, bp.vx_noise), rng.normal(bp.vy, bp.vy_noise)
+            self.asteroids.append(Asteroid(x, y, vx, vy, cfg, size=bp.size))
+        for _ in range(max(0, cfg.num_asteroids - len(cfg.asteroid_spawns or []))):
+            for _attempt in range(200):
+                ax, ay = rng.uniform(0, self.width), rng.uniform(0, self.height)
+                if all(self._wrapped_dist((ax, ay), s.pos) >= cfg.asteroid_clear_radius
+                       for s in self.ships.values()):
+                    break
+            angle = rng.uniform(0, 2 * math.pi)
+            speed = rng.uniform(*cfg.asteroid_speed_range)
+            self.asteroids.append(Asteroid(ax, ay, math.cos(angle) * speed, math.sin(angle) * speed, cfg, size=3))
 
-        # Ensure the final output is a float32 numpy array
-        return np.array(obs, dtype=np.float32)
-
-    def _get_action_space(self):
-        # [Thrust (2), Turn (3), Shoot (2)]
-        return gym.spaces.MultiDiscrete([2, 3, 2])
+    # ---------------------------------------------------------------- physics
 
     def _apply_action(self, agent_name, action):
+        cfg = self.config
         ship = self.ships[agent_name]
-        if not ship.active:
-            return
+        thrust, turn, shoot = int(action[0]), int(action[1]), int(action[2])
 
-        thrust, turn, shoot = action
-        
-        # 1. Turn Logic (Radians)
-        turn_speed = self.config.turn_speed
         if turn == 1:
-            ship.angle -= turn_speed # Left
+            ship.angle -= cfg.turn_speed
         elif turn == 2:
-            ship.angle += turn_speed # Right
-            
-        # 2. Thrust Logic
-        thrust_power = self.config.thrust_power
+            ship.angle += cfg.turn_speed
+        ship.angle = (ship.angle + math.pi) % (2 * math.pi) - math.pi
+
         if thrust == 1:
-            # Standard 2D vector resolution using trigonometry
-            ship.vel[0] += math.cos(ship.angle) * thrust_power
-            ship.vel[1] += math.sin(ship.angle) * thrust_power
-            
-        # 3. Shoot Logic
+            ship.vel[0] += math.cos(ship.angle) * cfg.thrust_power
+            ship.vel[1] += math.sin(ship.angle) * cfg.thrust_power
+            speed = math.hypot(ship.vel[0], ship.vel[1])
+            if speed > cfg.max_speed:
+                ship.vel *= cfg.max_speed / speed
+
         if shoot == 1 and ship.cooldown <= 0:
-            # Spawn bullet slightly ahead of the ship so it doesn't shoot itself
-            bullet_x = ship.pos[0] + math.cos(ship.angle) * (ship.radius + 5)
-            bullet_y = ship.pos[1] + math.sin(ship.angle) * (ship.radius + 5)
-            
-            # Bullet velocity is ship velocity + bullet speed
-            bullet_speed = self.config.bullet_speed
-            b_vx = ship.vel[0] + math.cos(ship.angle) * bullet_speed
-            b_vy = ship.vel[1] + math.sin(ship.angle) * bullet_speed
-            
-            self.bullets.append(Bullet(bullet_x, bullet_y, b_vx, b_vy, owner_name=agent_name, team_id=ship.team_id))
-            
-            # Prevent rapid-fire (e.g., 15 frames between shots)
+            c, s = math.cos(ship.angle), math.sin(ship.angle)
+            bx = ship.pos[0] + c * (ship.radius + 5)
+            by = ship.pos[1] + s * (ship.radius + 5)
+            bvx = ship.vel[0] + c * cfg.bullet_speed
+            bvy = ship.vel[1] + s * cfg.bullet_speed
+            self.bullets.append(Bullet(bx, by, bvx, bvy, agent_name, ship.team_id, cfg))
             ship.cooldown = ship.fire_rate
 
-
     def _step_physics(self):
-        # 1. Update Ships
+        drag = self.config.drag_coefficient
+        size = np.array([self.width, self.height])
         for ship in self.ships.values():
-            if not ship.active: continue
-            
+            if not ship.active:
+                continue
             ship.pos += ship.vel
-            # Apply space drag (99% velocity retention per frame)
-            ship.vel *= self.config.drag_coefficient 
-            # Wrap-around
-            ship.pos[0] %= self.width
-            ship.pos[1] %= self.height
-            # Reduce shoot cooldown
+            ship.vel *= drag
+            ship.pos %= size
             if ship.cooldown > 0:
                 ship.cooldown -= 1
-
-        # 2. Update Asteroids
         for ast in self.asteroids:
-            if not ast.active: continue
-            ast.pos += ast.vel
-            ast.pos[0] %= self.width
-            ast.pos[1] %= self.height
+            if ast.active:
+                ast.pos += ast.vel
+                ast.pos %= size
+        alive = []
+        for b in self.bullets:
+            b.pos += b.vel
+            b.pos %= size
+            b.lifespan -= 1
+            if b.lifespan > 0 and b.active:
+                alive.append(b)
+        self.bullets = alive
 
-        # 3. Update Bullets
-        active_bullets = []
-        for bullet in self.bullets:
-            bullet.pos += bullet.vel
-            bullet.pos[0] %= self.width
-            bullet.pos[1] %= self.height
-            bullet.lifespan -= 1
-            
-            if bullet.lifespan > 0 and bullet.active:
-                active_bullets.append(bullet)
-        
-        self.bullets = active_bullets # Remove dead bullets
-
-    def _get_relative_wrapped_distance(self, ego_pos, target_pos):
-        """
-        Calculates the shortest dx, dy across a toroidal map.
-        """
-        dx = (target_pos[0] - ego_pos[0] + self.width / 2) % self.width - self.width / 2
-        dy = (target_pos[1] - ego_pos[1] + self.height / 2) % self.height - self.height / 2
-        
-        distance = math.sqrt(dx**2 + dy**2)
-        return dx, dy, distance
-    
-    def _resolve_collisions(self):
+    def _resolve_collisions(self) -> List[Tuple[str, str]]:
+        kill_events = []
         new_asteroids = []
-        kill_events = []  # <--- NEW: Create the receipt book
-        
-        # 1. Bullets vs. Ships
-        for bullet in self.bullets:
-            if not bullet.active: continue
-            
-            for agent_name, ship in self.ships.items():
-                if not ship.active: continue
-                
-                # Prevent a ship from shooting itself on frame 1
-                if bullet.owner_name == agent_name: 
-                    continue
-                    
-                # Check Friendly Fire config
-                if not self.friendly_fire and bullet.team_id == ship.team_id:
-                    continue
-                    
-                # Distance check using toroidal math
-                _, _, dist = self._get_relative_wrapped_distance(bullet.pos, ship.pos)
-                
-                if dist < (bullet.radius + ship.radius):
-                    bullet.active = False
-                    ship.active = False
-                    
-                    # <--- THE MAGIC LINK: Record who killed who! --->
-                    kill_events.append((bullet.owner_name, agent_name)) 
-                    break # Bullet is destroyed, move to next bullet
 
-        # 2. Bullets vs. Asteroids
-        for bullet in self.bullets:
-            if not bullet.active: continue
-            
+        # Bullets vs ships
+        for b in self.bullets:
+            if not b.active:
+                continue
+            for name, ship in self.ships.items():
+                if not ship.active or b.owner_name == name:
+                    continue
+                if not self.friendly_fire and b.team_id == ship.team_id:
+                    continue
+                if self._wrapped_dist(b.pos, ship.pos) < b.radius + ship.radius:
+                    b.active = False
+                    ship.active = False
+                    kill_events.append((b.owner_name, name))
+                    break
+
+        # Bullets vs asteroids
+        for b in self.bullets:
+            if not b.active:
+                continue
             for ast in self.asteroids:
-                if not ast.active: continue
-                
-                _, _, dist = self._get_relative_wrapped_distance(bullet.pos, ast.pos)
-                
-                if dist < (bullet.radius + ast.radius):
-                    bullet.active = False # Bullet always dies on impact
-                    
+                if not ast.active:
+                    continue
+                if self._wrapped_dist(b.pos, ast.pos) < b.radius + ast.radius:
+                    b.active = False
                     if self.asteroids_split:
                         ast.active = False
                         if ast.size > 1:
-                            # Split into 2 smaller asteroids
-                            new_size = ast.size - 1
-                            
-                            # Deflect velocities by +45 and -45 degrees and speed them up
-                            angle1 = math.atan2(ast.vel[1], ast.vel[0]) + (math.pi / 4)
-                            angle2 = math.atan2(ast.vel[1], ast.vel[0]) - (math.pi / 4)
-                            speed = math.hypot(ast.vel[0], ast.vel[1]) * 1.5 
-                            
-                            ast1 = Asteroid(ast.pos[0], ast.pos[1], 
-                                            math.cos(angle1) * speed, math.sin(angle1) * speed, 
-                                            size=new_size)
-                            ast2 = Asteroid(ast.pos[0], ast.pos[1], 
-                                            math.cos(angle2) * speed, math.sin(angle2) * speed, 
-                                            size=new_size)
-                            new_asteroids.extend([ast1, ast2])
+                            heading = math.atan2(ast.vel[1], ast.vel[0])
+                            speed = math.hypot(ast.vel[0], ast.vel[1]) * 1.5
+                            for off in (math.pi / 4, -math.pi / 4):
+                                new_asteroids.append(Asteroid(
+                                    ast.pos[0], ast.pos[1],
+                                    math.cos(heading + off) * speed, math.sin(heading + off) * speed,
+                                    self.config, size=ast.size - 1))
                     break
 
-        # 3. Ships vs. Asteroids (Crashing)
-        for agent_name, ship in self.ships.items():
-            if not ship.active: continue
-            
+        # Ships vs asteroids
+        for name, ship in self.ships.items():
+            if not ship.active:
+                continue
             for ast in self.asteroids:
-                if not ast.active: continue
-                
-                _, _, dist = self._get_relative_wrapped_distance(ship.pos, ast.pos)
-                
-                if dist < (ship.radius + ast.radius):
+                if ast.active and self._wrapped_dist(ship.pos, ast.pos) < ship.radius + ast.radius:
                     ship.active = False
-                    # <--- NEW: The asteroid claims a victim --->
-                    kill_events.append(("asteroid", agent_name)) 
+                    kill_events.append(("asteroid", name))
                     break
-                    
-        # 4. Ships vs. Ships (Ramming)
-        # <--- CHANGED: Use items() so we can extract the names --->
-        ships_list = list(self.ships.items()) 
-        
-        for i in range(len(ships_list)):
-            name_a, ship_a = ships_list[i]
-            if not ship_a.active: continue
-            
-            for j in range(i + 1, len(ships_list)):
-                name_b, ship_b = ships_list[j]
-                if not ship_b.active: continue
-                
-                _, _, dist = self._get_relative_wrapped_distance(ship_a.pos, ship_b.pos)
-                
-                if dist < (ship_a.radius + ship_b.radius):
-                    ship_a.active = False
-                    ship_b.active = False
-                    
-                    # <--- NEW: Both ships suffer a death penalty, neither gets a kill --->
-                    kill_events.append(("ram", name_a))
-                    kill_events.append(("ram", name_b))
 
-        # 5. Cleanup
+        # Ships vs ships (ramming kills both, no kill credit)
+        names = list(self.ships)
+        for i, na in enumerate(names):
+            sa = self.ships[na]
+            if not sa.active:
+                continue
+            for nb in names[i + 1:]:
+                sb = self.ships[nb]
+                if sb.active and self._wrapped_dist(sa.pos, sb.pos) < sa.radius + sb.radius:
+                    sa.active = sb.active = False
+                    kill_events.extend([("ram", na), ("ram", nb)])
+                    break
+
         if self.asteroids_split:
-            # Remove destroyed asteroids and append new ones
-            self.asteroids = [ast for ast in self.asteroids if ast.active]
-            self.asteroids.extend(new_asteroids)
-            
-        # <--- NEW: Hand the receipts back to the step() function --->
+            self.asteroids = [a for a in self.asteroids if a.active] + new_asteroids
         return kill_events
 
+    # --------------------------------------------------------------- geometry
+
+    def _wrap(self, d: np.ndarray) -> np.ndarray:
+        """Wrap displacement(s) (..., 2) to the shortest toroidal image."""
+        size = np.array([self.width, self.height])
+        return (d + size / 2) % size - size / 2
+
+    def _wrapped_dist(self, a, b) -> float:
+        dx = (b[0] - a[0] + self.width / 2) % self.width - self.width / 2
+        dy = (b[1] - a[1] + self.height / 2) % self.height - self.height / 2
+        return math.hypot(dx, dy)
+
+    def wrapped_delta(self, ego_pos, target_pos):
+        """Shortest (dx, dy, dist) from ego to target on the torus."""
+        dx = (target_pos[0] - ego_pos[0] + self.width / 2) % self.width - self.width / 2
+        dy = (target_pos[1] - ego_pos[1] + self.height / 2) % self.height - self.height / 2
+        return dx, dy, math.hypot(dx, dy)
+
+    # Backwards-compatible name used by the scripted policies
+    _get_relative_wrapped_distance = wrapped_delta
+
+    def _team_alive(self, team: int) -> int:
+        return sum(1 for a in self.team_agents[team] if self.ships[a].active)
+
+    # ----------------------------------------------------------- observations
+
+    def _compute_obs(self):
+        """Compute observations for every possible agent in one vectorized pass.
+
+        Layout per agent:
+          ego (8): alive, v_fwd, v_lat, cooldown_frac, can_shoot, allies_alive_frac,
+                   enemies_alive_frac, time_left_frac
+          enemies (k x 15), allies (k x 12), asteroids (k x 9), bullets (k x 10)
+          base slot features (8): present, dx, dy, dist, rel_vx, rel_vy (ego frame),
+                   tca, closest_approach_miss
+          enemy extras: lead-aim error (cos, sin), intercept time, predicted miss if I fire now,
+                   their aim at me (cos), their predicted miss on me if they fire, their cooldown
+          ally extras: their heading in my frame (cos, sin), my friendly-fire miss on them, cooldown
+          asteroid extras: radius
+          bullet extras: hostile flag, remaining life
+        """
+        cfg = self.config
+        S = len(self.possible_agents)
+        ships = [self.ships[a] for a in self.possible_agents]
+        L = max(self.width, self.height) / 2
+        vref = 2 * cfg.max_speed + cfg.bullet_speed
+
+        P = np.array([s.pos for s in ships])                   # (S,2)
+        V = np.array([s.vel for s in ships])
+        A = np.array([s.angle for s in ships])
+        team = np.array([s.team_id for s in ships])
+        alive = np.array([s.active for s in ships])
+        cd = np.array([s.cooldown / max(1, s.fire_rate) for s in ships])
+        rad = np.array([s.radius for s in ships])
+        c, s_ = np.cos(A)[:, None], np.sin(A)[:, None]         # (S,1)
+        H = np.stack([np.cos(A), np.sin(A)], axis=1)           # (S,2)
+
+        def rot(vec):  # (S,N,2) world -> ego frame of each row's ego
+            return np.stack([c * vec[..., 0] + s_ * vec[..., 1],
+                             -s_ * vec[..., 0] + c * vec[..., 1]], axis=-1)
+
+        def base(Pt, Vt, rt):
+            D = self._wrap(Pt[None, :, :] - P[:, None, :])     # (S,N,2)
+            RV = Vt[None, :, :] - V[:, None, :]
+            dist = np.linalg.norm(D, axis=-1)
+            rv2 = (RV ** 2).sum(-1)
+            tca = np.clip(-(D * RV).sum(-1) / (rv2 + _EPS), 0.0, TCA_HORIZON)
+            miss = np.linalg.norm(D + RV * tca[..., None], axis=-1) - (rad[:, None] + rt[None, :])
+            Dr, RVr = rot(D), rot(RV)
+            feats = np.stack([
+                np.ones_like(dist),
+                Dr[..., 0] / L, Dr[..., 1] / L, dist / L,
+                RVr[..., 0] / vref, RVr[..., 1] / vref,
+                tca / TCA_HORIZON, np.clip(miss / MISS_SCALE, -1, 1),
+            ], axis=-1)
+            return D, RV, dist, tca, miss, feats
+
+        def shot_miss(Pt, Vt, rt):
+            """Predicted closest-approach miss (px) of a bullet fired now by each ego at each target."""
+            b0 = P + H * (rad[:, None] + 5)
+            vb = V + H * cfg.bullet_speed
+            p = self._wrap(Pt[None] - b0[:, None])
+            w = Vt[None] - vb[:, None]
+            t = np.clip(-(p * w).sum(-1) / ((w ** 2).sum(-1) + _EPS), 0.0, cfg.bullet_lifespan)
+            return np.linalg.norm(p + w * t[..., None], axis=-1) - (rt[None] + cfg.bullet_radius)
+
+        rows = np.arange(S)[:, None]
+
+        def select(key, k):
+            """Indices of the k smallest keys per row (inf = invalid) and a presence mask."""
+            n = key.shape[1]
+            order = np.zeros((S, k), dtype=np.intp)
+            present = np.zeros((S, k), dtype=bool)
+            if n == 0:
+                return order, present
+            m = min(n, k)
+            o = np.argsort(key, axis=1)[:, :m]
+            order[:, :m] = o
+            present[:, :m] = np.isfinite(key[rows, o])
+            return order, present
+
+        def gather(feats, order, present):
+            out = feats[rows, order]
+            out[~present] = 0.0
+            return out.reshape(S, -1)
+
+        blocks = []
+
+        # Ego
+        Vr = np.stack([c[:, 0] * V[:, 0] + s_[:, 0] * V[:, 1], -s_[:, 0] * V[:, 0] + c[:, 0] * V[:, 1]], 1)
+        red_alive = alive[team == RED].sum()
+        blue_alive = alive[team == BLUE].sum()
+        own_alive = np.where(team == RED, red_alive, blue_alive)
+        opp_alive = np.where(team == RED, blue_alive, red_alive)
+        own_n = np.where(team == RED, self.n_red, self.m_blue)
+        opp_n = np.where(team == RED, self.m_blue, self.n_red)
+        ego = np.stack([
+            np.ones(S), Vr[:, 0] / cfg.max_speed, Vr[:, 1] / cfg.max_speed, cd,
+            np.array([s.cooldown <= 0 for s in ships], dtype=float),
+            (own_alive - 1) / np.maximum(1, own_n - 1), opp_alive / np.maximum(1, opp_n),
+            np.full(S, 1.0 - self.frame / cfg.max_frames),
+        ], axis=1)
+        blocks.append(ego)
+
+        # Ships (enemies and allies share pairwise computations)
+        D, RV, dist, tca, miss, feats = base(P, V, rad)
+        smiss = shot_miss(P, V, rad)                           # (S,S) ego i fires at j
+        # Lead-aim intercept: |D + RV t| = bullet_speed * t
+        a = (RV ** 2).sum(-1) - cfg.bullet_speed ** 2
+        b = 2 * (D * RV).sum(-1)
+        cc = (D ** 2).sum(-1)
+        disc = b * b - 4 * a * cc
+        sq = np.sqrt(np.maximum(disc, 0))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t1 = np.where(np.abs(a) > _EPS, (-b - sq) / (2 * a), -cc / np.where(np.abs(b) > _EPS, b, -_EPS))
+            t2 = np.where(np.abs(a) > _EPS, (-b + sq) / (2 * a), t1)
+        t1 = np.where(t1 > 0, t1, np.inf)
+        t2 = np.where(t2 > 0, t2, np.inf)
+        t_int = np.minimum(t1, t2)
+        valid = (disc >= 0) & np.isfinite(t_int)
+        aim_vec = np.where(valid[..., None], D + RV * np.where(valid, t_int, 0)[..., None], D)
+        aim_r = rot(aim_vec)
+        aim_n = np.linalg.norm(aim_r, axis=-1) + _EPS
+        aim_cos, aim_sin = aim_r[..., 0] / aim_n, aim_r[..., 1] / aim_n
+        t_int_f = np.where(valid, np.clip(t_int / cfg.bullet_lifespan, 0, 1), 1.0)
+        dir_cos = (H[:, None, :] * D).sum(-1) / (dist + _EPS)  # my heading vs direction to j
+        their_aim = dir_cos.T                                  # j's heading vs direction to me
+        their_smiss = smiss.T
+        Hr = rot(np.broadcast_to(H[None], (S, S, 2)))
+
+        enemy_feats = np.concatenate([feats, np.stack([
+            aim_cos, aim_sin, t_int_f, np.clip(smiss / SHOT_SCALE, -1, 1),
+            their_aim, np.clip(their_smiss / SHOT_SCALE, -1, 1), np.broadcast_to(cd[None], (S, S)),
+        ], -1)], -1)
+        ally_feats = np.concatenate([feats, np.stack([
+            Hr[..., 0], Hr[..., 1], np.clip(smiss / SHOT_SCALE, -1, 1), np.broadcast_to(cd[None], (S, S)),
+        ], -1)], -1)
+
+        eye = np.eye(S, dtype=bool)
+        both_alive = alive[:, None] & alive[None, :]
+        same_team = team[:, None] == team[None, :]
+        enemy_key = np.where(both_alive & ~same_team, dist, np.inf)
+        ally_key = np.where(both_alive & same_team & ~eye, dist, np.inf)
+        e_ord, e_pres = select(enemy_key, cfg.obs_enemies)
+        a_ord, a_pres = select(ally_key, cfg.obs_allies)
+        blocks.append(gather(enemy_feats, e_ord, e_pres))
+        blocks.append(gather(ally_feats, a_ord, a_pres))
+
+        # Asteroids
+        asts = [x for x in self.asteroids if x.active]
+        if asts:
+            Pa = np.array([x.pos for x in asts]); Va = np.array([x.vel for x in asts])
+            ra = np.array([x.radius for x in asts])
+            _, _, adist, atca, amiss, afeats = base(Pa, Va, ra)
+            afeats = np.concatenate([afeats, np.broadcast_to((ra / cfg.asteroid_large_radius)[None, :, None],
+                                                             (S, len(asts), 1))], -1)
+            akey = np.where(alive[:, None], adist, np.inf)
+        else:
+            adist = atca = amiss = np.zeros((S, 0))
+            afeats = np.zeros((S, 0, ASTEROID_DIM)); akey = np.zeros((S, 0))
+        o, p = select(akey, cfg.obs_asteroids)
+        blocks.append(gather(afeats, o, p) if asts else np.zeros((S, cfg.obs_asteroids * ASTEROID_DIM)))
+
+        # Bullets that can hurt each ego (never its own)
+        bl = [x for x in self.bullets if x.active]
+        if bl:
+            Pb = np.array([x.pos for x in bl]); Vb = np.array([x.vel for x in bl])
+            rb = np.array([x.radius for x in bl])
+            bteam = np.array([x.team_id for x in bl])
+            owner = np.array([self.agent_index.get(x.owner_name, -1) for x in bl])
+            _, _, bdist, btca, bmiss, bfeats = base(Pb, Vb, rb)
+            hostile = (bteam[None, :] != team[:, None]).astype(float)
+            life = np.broadcast_to(np.array([x.lifespan / cfg.bullet_lifespan for x in bl])[None], hostile.shape)
+            bfeats = np.concatenate([bfeats, np.stack([hostile, life], -1)], -1)
+            can_hurt = (hostile > 0) | self.friendly_fire
+            can_hurt &= owner[None, :] != np.arange(S)[:, None]
+            bkey = np.where(alive[:, None] & can_hurt, bdist, np.inf)
+            o, p = select(bkey, cfg.obs_bullets)
+            blocks.append(gather(bfeats, o, p))
+        else:
+            bmiss = btca = np.zeros((S, 0)); bkey = np.zeros((S, 0))
+            blocks.append(np.zeros((S, cfg.obs_bullets * BULLET_DIM)))
+
+        obs = np.clip(np.concatenate(blocks, axis=1), -1.0, 1.0).astype(np.float32)
+        obs[~alive] = 0.0
+        self._obs = obs
+
+        # Cache shaping primitives
+        self._cache = dict(
+            alive=alive, enemy_key=enemy_key, aim_cos=aim_cos, dist=dist,
+            ship_tca=tca, ship_miss=miss,
+            ast_key=akey, ast_tca=atca, ast_miss=amiss,
+            bul_key=bkey, bul_tca=btca, bul_miss=bmiss,
+        )
+
+    def _potentials(self) -> np.ndarray:
+        """Shaping potential per agent: aim at + stay in range of nearest enemy, avoid imminent hits."""
+        rc = self.config.rewards
+        k = self._cache
+        S = len(self.possible_agents)
+        phi = np.zeros(S)
+        for i in range(S):
+            if not k["alive"][i]:
+                continue
+            row = k["enemy_key"][i]
+            if np.isfinite(row).any():
+                j = int(np.argmin(row))
+                aim_q = (1.0 + k["aim_cos"][i, j]) / 2.0
+                range_q = float(np.clip(1.0 - max(0.0, k["dist"][i, j] - 250.0) / 400.0, 0.0, 1.0))
+                phi[i] += rc.aim_weight * aim_q ** 2 + rc.approach_weight * range_q
+            threat = 0.0
+            for key, tca, miss in (("ast_key", "ast_tca", "ast_miss"), ("bul_key", "bul_tca", "bul_miss")):
+                valid = np.isfinite(k[key][i])
+                if valid.any():
+                    t = (1.0 - np.clip(k[miss][i][valid], 0, 60) / 60.0) * (1.0 - k[tca][i][valid] / TCA_HORIZON)
+                    threat = max(threat, float(t.max()))
+            phi[i] -= rc.hazard_weight * threat
+        return phi
+
+    # -------------------------------------------------------------- rendering
+
+    def render(self):
+        if self.render_mode is None:
+            return None
+        import pygame
+
+        if self.screen is None:
+            pygame.init()
+            if self.render_mode == "human":
+                pygame.display.init()
+                self.screen = pygame.display.set_mode((int(self.width), int(self.height)))
+            else:
+                self.screen = pygame.Surface((int(self.width), int(self.height)))
+            self.clock = pygame.time.Clock()
+            pygame.font.init()
+            self.font = pygame.font.SysFont("Arial", 14)
+
+        self.screen.fill((0, 0, 0))
+        for ast in self.asteroids:
+            if ast.active:
+                center = (int(ast.pos[0]), int(ast.pos[1]))
+                pygame.draw.circle(self.screen, (150, 150, 150), center, int(ast.radius))
+                pygame.draw.circle(self.screen, (200, 200, 200), center, int(ast.radius), 1)
+        for b in self.bullets:
+            if b.active:
+                color = (255, 140, 120) if b.team_id == RED else (140, 200, 255)
+                pygame.draw.circle(self.screen, color, (int(b.pos[0]), int(b.pos[1])), max(2, int(b.radius)))
+        for name, ship in self.ships.items():
+            if not ship.active:
+                continue
+            color = (255, 50, 50) if ship.team_id == RED else (50, 150, 255)
+            pts = [(int(ship.pos[0] + math.cos(ship.angle + o) * ship.radius * m),
+                    int(ship.pos[1] + math.sin(ship.angle + o) * ship.radius * m))
+                   for o, m in ((0, 1.3), (2.5, 1.0), (-2.5, 1.0))]
+            pygame.draw.polygon(self.screen, color, pts)
+            label = self.font.render(name.split("_")[1], True, color)
+            self.screen.blit(label, (int(ship.pos[0]) + 12, int(ship.pos[1]) - 12))
+        hud = self.font.render(
+            f"frame {self.frame}/{self.config.max_frames}  red {self._team_alive(RED)}  blue {self._team_alive(BLUE)}",
+            True, (200, 200, 200))
+        self.screen.blit(hud, (8, 8))
+
+        if self.render_mode == "human":
+            pygame.event.pump()
+            pygame.display.flip()
+            self.clock.tick(self.metadata["render_fps"])
+            return None
+        return np.transpose(np.array(pygame.surfarray.pixels3d(self.screen)), (1, 0, 2)).copy()
+
+    def close(self):
+        if self.screen is not None:
+            import pygame
+            pygame.quit()
+            self.screen = None

@@ -1,142 +1,191 @@
-import random
+"""Policies that control a set of ships.
+
+All policies share one batched interface::
+
+    actions = policy.act(obs, contexts)   # obs: (N, obs_dim), contexts: [(env, agent_name), ...]
+
+Scripted policies use the contexts (exact physics state); network policies use the obs.
+"""
+from __future__ import annotations
+
 import math
-import pygame
+from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch as th
+
+Context = Tuple["TeamAsteroidsEnv", str]  # noqa: F821
+
+NOOP = np.array([0, 0, 0], dtype=np.int64)
 
 
-def get_human_action():
-    """Maps keyboard state to [Thrust, Turn, Shoot]"""
-    keys = pygame.key.get_pressed()
-    
-    # Thrust: W or Up Arrow
-    thrust = 1 if keys[pygame.K_UP] or keys[pygame.K_w] else 0
-    
-    # Turn: A/Left Arrow (1) or D/Right Arrow (2)
-    turn = 0
-    if keys[pygame.K_LEFT] or keys[pygame.K_a]:
-        turn = 1
-    elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-        turn = 2
-        
-    # Shoot: Spacebar
-    shoot = 1 if keys[pygame.K_SPACE] else 0
-    
-    return [thrust, turn, shoot]
+class Policy:
+    name: str = "policy"
 
-def get_dummy_action():
-    return [0, 0, 0]
+    def act(self, obs: np.ndarray, contexts: Sequence[Context]) -> np.ndarray:
+        raise NotImplementedError
 
-def get_heuristic_action(base_env, agent_name, p=1.0):
-    """The smart bot. We pass the base_env so it can read exact physics coordinates."""
-    if random.random() > p:
-        return [0, 0, 0]
-        
-    ego_ship = base_env.ships[agent_name]
-    if not ego_ship.active: return [0, 0, 0]
+    def __repr__(self):
+        return f"{type(self).__name__}({self.name})"
 
-    # Evasion Logic
-    danger_zone = 100.0
-    closest_threat_dist = float('inf')
-    threat_dx, threat_dy = 0, 0
 
-    for ast in base_env.asteroids:
+# ---------------------------------------------------------------- scripted
+
+
+def _angle_diff(target, current):
+    return (target - current + math.pi) % (2 * math.pi) - math.pi
+
+
+def _steer(angle_diff, tol=0.1):
+    return 2 if angle_diff > tol else (1 if angle_diff < -tol else 0)
+
+
+def heuristic_action(env, agent_name, rng, p: float = 1.0, danger_zone: float = 100.0):
+    """The original 'smart' bot: flee the nearest threat, otherwise turn to the enemy and shoot.
+
+    With probability ``1 - p`` it does nothing this step (the legacy "p% optimal" knob).
+    """
+    if rng.random() > p:
+        return NOOP.copy()
+    ego = env.ships[agent_name]
+    if not ego.active:
+        return NOOP.copy()
+
+    closest, tdx, tdy = float("inf"), 0.0, 0.0
+    for ast in env.asteroids:
         if ast.active:
-            dx, dy, dist = base_env._get_relative_wrapped_distance(ego_ship.pos, ast.pos)
-            if dist < closest_threat_dist:
-                closest_threat_dist = dist
-                threat_dx, threat_dy = dx, dy
+            dx, dy, d = env.wrapped_delta(ego.pos, ast.pos)
+            if d < closest:
+                closest, tdx, tdy = d, dx, dy
+    for b in env.bullets:
+        if b.active and b.team_id != ego.team_id:
+            dx, dy, d = env.wrapped_delta(ego.pos, b.pos)
+            if d < closest:
+                closest, tdx, tdy = d, dx, dy
+    if closest < danger_zone:
+        diff = _angle_diff(math.atan2(-tdy, -tdx), ego.angle)
+        return np.array([1 if abs(diff) < 1.5 else 0, _steer(diff), 0])
 
-    for bullet in base_env.bullets:
-        if bullet.active and bullet.team_id != ego_ship.team_id:
-            dx, dy, dist = base_env._get_relative_wrapped_distance(ego_ship.pos, bullet.pos)
-            if dist < closest_threat_dist:
-                closest_threat_dist = dist
-                threat_dx, threat_dy = dx, dy
-
-    if closest_threat_dist < danger_zone:
-        escape_angle = math.atan2(-threat_dy, -threat_dx)
-        angle_diff = (escape_angle - (ego_ship.angle % (2 * math.pi)) + math.pi) % (2 * math.pi) - math.pi
-        turn = 2 if angle_diff > 0.1 else (1 if angle_diff < -0.1 else 0)
-        thrust = 1 if abs(angle_diff) < 1.5 else 0 
-        return [thrust, turn, 0]
-
-    # Attack Logic
-    closest_dist = float('inf')
-    target_pos = None
-
-    for other_name, other_ship in base_env.ships.items():
-        if other_name == agent_name: continue
-        if other_ship.active and other_ship.team_id != ego_ship.team_id:
-            dx, dy, dist = base_env._get_relative_wrapped_distance(ego_ship.pos, other_ship.pos)
-            if dist < closest_dist:
-                closest_dist = dist
-                target_pos = (ego_ship.pos[0] + dx, ego_ship.pos[1] + dy)
-
-    if target_pos is None: return [0, 0, 0]
-
-    target_angle = math.atan2(target_pos[1] - ego_ship.pos[1], target_pos[0] - ego_ship.pos[0])
-    angle_diff = (target_angle - (ego_ship.angle % (2 * math.pi)) + math.pi) % (2 * math.pi) - math.pi
-
-    turn = 2 if angle_diff > 0.1 else (1 if angle_diff < -0.1 else 0)
-    shoot = 1 if abs(angle_diff) < 0.2 else 0
-    thrust = 1 if abs(angle_diff) < 0.5 and closest_dist > 150 else 0
-
-    return [thrust, turn, shoot]
+    best, tgt = float("inf"), None
+    for name, other in env.ships.items():
+        if name != agent_name and other.active and other.team_id != ego.team_id:
+            dx, dy, d = env.wrapped_delta(ego.pos, other.pos)
+            if d < best:
+                best, tgt = d, (dx, dy)
+    if tgt is None:
+        return NOOP.copy()
+    diff = _angle_diff(math.atan2(tgt[1], tgt[0]), ego.angle)
+    return np.array([1 if abs(diff) < 0.5 and best > 150 else 0, _steer(diff), 1 if abs(diff) < 0.2 else 0])
 
 
-def get_evasion_dummy_action(base_env, agent_name, ast_only=False, is_shooting=False):
-
-    ego_ship = base_env.ships[agent_name]
-    if not ego_ship.active: return [0, 0, 0]
-
-    # Evasion Logic
-    danger_zone = 150.0
-    closest_threat_dist = float('inf')
-    threat_dx, threat_dy = 0, 0
-
-    for ast in base_env.asteroids:
-        if ast.active:
-            dx, dy, dist = base_env._get_relative_wrapped_distance(ego_ship.pos, ast.pos)
-            if dist < closest_threat_dist:
-                closest_threat_dist = dist
-                threat_dx, threat_dy = dx, dy
-
+def evasion_action(env, agent_name, rng, ast_only=False, shooting=False, danger_zone=150.0):
+    """Non-aggressive bot: flees threats (asteroids, bullets, ships), otherwise wanders."""
+    ego = env.ships[agent_name]
+    if not ego.active:
+        return NOOP.copy()
+    closest, tdx, tdy = float("inf"), 0.0, 0.0
+    threats = [a.pos for a in env.asteroids if a.active]
     if not ast_only:
-        for bullet in base_env.bullets:
-            if bullet.active and bullet.team_id != ego_ship.team_id:
-                dx, dy, dist = base_env._get_relative_wrapped_distance(ego_ship.pos, bullet.pos)
-                if dist < closest_threat_dist:
-                    closest_threat_dist = dist
-                    threat_dx, threat_dy = dx, dy
+        threats += [b.pos for b in env.bullets if b.active and b.team_id != ego.team_id]
+    threats += [s.pos for n, s in env.ships.items() if n != agent_name and s.active]
+    for pos in threats:
+        dx, dy, d = env.wrapped_delta(ego.pos, pos)
+        if d < closest:
+            closest, tdx, tdy = d, dx, dy
+    if closest < danger_zone:
+        diff = _angle_diff(math.atan2(-tdy, -tdx), ego.angle)
+        return np.array([1 if abs(diff) < 1.5 else 0, _steer(diff), 0])
+    u = rng.random(4)
+    turn = 1 if u[1] < 0.1 else (2 if u[2] > 0.9 else 0)
+    return np.array([int(u[0] < 0.1), turn, int(shooting and u[3] < 0.1)])
 
-    for name, ship in base_env.ships.items():
-        if name == agent_name: continue
-        if ship.active:
-            dx, dy, dist = base_env._get_relative_wrapped_distance(ego_ship.pos, ship.pos)
-            if dist < closest_threat_dist:
-                closest_threat_dist = dist
-                threat_dx, threat_dy = dx, dy
 
-    if closest_threat_dist < danger_zone:
-        escape_angle = math.atan2(-threat_dy, -threat_dx)
-        angle_diff = (escape_angle - (ego_ship.angle % (2 * math.pi)) + math.pi) % (2 * math.pi) - math.pi
-        turn = 2 if angle_diff > 0.1 else (1 if angle_diff < -0.1 else 0)
-        thrust = 1 if abs(angle_diff) < 1.5 else 0 
-        return [thrust, turn, 0]
-    
-    # Default logic
-    thrust = 0
-    turn = 0
-    shoot = 0
+class ScriptedPolicy(Policy):
+    """Wraps a per-agent scripted function ``fn(env, agent, rng, **kwargs)``."""
 
-    if random.random() < .1:
-        thrust = 1
-    if random.random() < .1:
-        turn = 1
-    if random.random() > .9:
-        turn = 2
-    if is_shooting:
-        if random.random() < .1:
-            shoot = 1
-    
+    def __init__(self, name, fn, seed: Optional[int] = None, **kwargs):
+        self.name = name
+        self.fn = fn
+        self.kwargs = kwargs
+        self.rng = np.random.default_rng(seed)
 
-    return [thrust, turn, shoot]
+    def act(self, obs, contexts):
+        if not contexts:
+            return np.zeros((0, 3), dtype=np.int64)
+        return np.stack([self.fn(env, agent, self.rng, **self.kwargs) for env, agent in contexts]).astype(np.int64)
+
+
+class DummyPolicy(Policy):
+    name = "dummy"
+
+    def act(self, obs, contexts):
+        return np.zeros((len(contexts), 3), dtype=np.int64)
+
+
+def make_scripted(name: str, seed: Optional[int] = None) -> Policy:
+    """Build a scripted policy by name: dummy, heuristic[_p], evasion, evasion_easy."""
+    if name == "dummy":
+        return DummyPolicy()
+    if name == "heuristic":
+        return ScriptedPolicy("heuristic_1.0", heuristic_action, seed, p=1.0)
+    if name.startswith("heuristic_"):
+        p = float(name.split("_")[1])
+        return ScriptedPolicy(name, heuristic_action, seed, p=p)
+    if name == "evasion":
+        return ScriptedPolicy(name, evasion_action, seed)
+    if name == "evasion_easy":
+        return ScriptedPolicy(name, evasion_action, seed, ast_only=True)
+    raise KeyError(f"Unknown scripted policy {name!r}")
+
+
+SCRIPTED_NAMES = ["dummy", "evasion_easy", "evasion", "heuristic_0.25", "heuristic_0.5",
+                  "heuristic_0.75", "heuristic_1.0"]
+
+
+# ------------------------------------------------------------------ network
+
+
+class NetworkPolicy(Policy):
+    """Batched inference with an SB3 ActorCriticPolicy (live reference or frozen copy)."""
+
+    def __init__(self, sb3_policy, name: str = "network", deterministic: bool = False):
+        self.policy = sb3_policy
+        self.name = name
+        self.deterministic = deterministic
+
+    @th.no_grad()
+    def act(self, obs, contexts):
+        if len(obs) == 0:
+            return np.zeros((0, 3), dtype=np.int64)
+        obs_t = th.as_tensor(np.asarray(obs, dtype=np.float32), device=self.policy.device)
+        actions = self.policy._predict(obs_t, deterministic=self.deterministic)
+        return actions.cpu().numpy().astype(np.int64).reshape(len(obs), -1)
+
+    @classmethod
+    def load(cls, path: str, name: Optional[str] = None, deterministic: bool = False, device="cpu"):
+        from stable_baselines3 import PPO
+        model = PPO.load(path, device=device)
+        model.policy.set_training_mode(False)
+        return cls(model.policy, name=name or path, deterministic=deterministic)
+
+
+class HumanPolicy(Policy):
+    """Keyboard control (WASD/arrows + space). Requires a pygame window."""
+    name = "human"
+
+    def act(self, obs, contexts):
+        import pygame
+        keys = pygame.key.get_pressed()
+        thrust = int(keys[pygame.K_UP] or keys[pygame.K_w])
+        turn = 1 if (keys[pygame.K_LEFT] or keys[pygame.K_a]) else (2 if (keys[pygame.K_RIGHT] or keys[pygame.K_d]) else 0)
+        shoot = int(keys[pygame.K_SPACE])
+        return np.tile(np.array([thrust, turn, shoot]), (len(contexts), 1))
+
+
+def resolve_policy(spec: str, seed: Optional[int] = None, deterministic: bool = True) -> Policy:
+    """Scripted policy name, or a path to an SB3 .zip checkpoint."""
+    if spec.endswith(".zip") or "/" in spec:
+        return NetworkPolicy.load(spec, name=spec, deterministic=deterministic)
+    if spec == "human":
+        return HumanPolicy()
+    return make_scripted(spec, seed)
