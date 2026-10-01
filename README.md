@@ -81,6 +81,17 @@ uv run python scripts/watch.py --scenario team3_large --blue human,heuristic_1.0
 - The projection wraps across the torus seam, so an enemy just past the map edge is drawn adjacent
   rather than a whole map away. The starfield scrolls and tiles with the camera.
 
+### Seeing what the agent sees
+
+`--show-obs` (or `Tab` while playing) overlays the observation vector decoded back into world space:
+the sensor ring, a marker per occupied observation slot with its relative-velocity vector, slot
+ranks, and a panel of the ego features in the units the policy receives. Markers land on the real
+objects, which is how you can confirm the decode is faithful.
+
+This doubles as a debugging tool and as the basis for human/agent parity: the display is built from
+the same numbers the policy gets. It costs nothing during training, since rendering never runs when
+`render_mode` is `None`.
+
 `--blue` / `--red` take one spec per team, or a comma-separated list assigning each ship
 individually (cycled). So `--blue human,heuristic_1.0` puts you in `blue_0` with an AI wingman, which
 is the most direct way to judge whether teammates actually cooperate.
@@ -136,9 +147,17 @@ Scripted opponents: `dummy`, `evasion_easy`, `evasion`, `heuristic_<p>` (acts wi
 ## Environment
 
 - Toroidal map. Actions `MultiDiscrete([2, 3, 2])` = (thrust, turn, shoot), repeated for
-  `action_repeat` = 2 physics frames. Episodes end when a team is eliminated or at `max_frames`.
+  `action_repeat` = 2 physics frames. Episodes end when a team is eliminated, or at `max_frames`
+  where the healthier team wins the timeout. `max_frames=None` means no clock at all, which is what
+  the demo scenarios use so a human game never ends on a timer.
 - Ships: speed capped at `max_speed`, bullets carry the ship's velocity, `fire_rate`-frame reload.
-  Friendly fire is on. Ramming and asteroid collisions are lethal.
+  Friendly fire is on.
+- **Durability**: 3 hull + 1 shield. Shield absorbs first and regenerates after
+  `shield_regen_delay` frames without being hit, so disengaging to recover is a real option; hull
+  damage is permanent. Bullets do 1, asteroid impacts 2, ramming 1. Collisions bounce the bodies
+  apart and a cooldown gates repeat collision damage, so contact is costly but survivable.
+  This is what makes focused fire worth learning: with one-hit kills, whoever shoots first takes
+  the kill alone and there is no reason to coordinate.
 - Asteroids: with `asteroids_split` a hit rock breaks into two smaller, faster fragments (the
   smallest size is destroyed outright), so clearing a rock creates a new hazard. Without it, rocks
   are indestructible cover that absorbs shots.
@@ -156,9 +175,11 @@ Scripted opponents: `dummy`, `evasion_easy`, `evasion`, `heuristic_<p>` (acts wi
   [-1, 1] independently. Clipping components destroyed bearing past the normalization scale: every
   distant object read as `(1, 1)`, so objects at 20°, 45°, and 70° were indistinguishable and large
   maps were unnavigable.
-- Reward (`RewardConfig`): kill +1, death -1, team kill -1 (shooter); mixed across the team by
-  `team_spirit`; shared win/loss at the end, also delivered to teammates who already died; plus
-  potential-based shaping (aim, range, hazard), which cannot change the optimal policy.
+- Reward (`RewardConfig`): kill +1, death -1, team kill -1 (shooter), plus small per-point damage
+  terms (+0.15 dealt, -0.15 taken) so the signal does not go sparse now that a kill takes four hits.
+  Finishing a target always beats chipping several. Mixed across the team by `team_spirit`; shared
+  win/loss at the end, also delivered to teammates who already died; plus potential-based shaping
+  (aim, range, hazard), which cannot change the optimal policy.
 
 ## Difficulty handicaps for human play
 

@@ -26,10 +26,10 @@ RED, BLUE = 0, 1
 TEAM_NAMES = ("red", "blue")
 
 # Per-slot feature widths (see _compute_obs for the layout)
-EGO_DIM = 8
+EGO_DIM = 10          # + own hull and shield fractions
 BASE_DIM = 8
-ENEMY_DIM = BASE_DIM + 7
-ALLY_DIM = BASE_DIM + 4
+ENEMY_DIM = BASE_DIM + 9   # + their hull and shield fractions
+ALLY_DIM = BASE_DIM + 6
 ASTEROID_DIM = BASE_DIM + 1
 BULLET_DIM = BASE_DIM + 2
 
@@ -101,6 +101,7 @@ class TeamAsteroidsEnv(ParallelEnv):
         self.winner: Optional[int] = None  # RED, BLUE, or -1 for draw once the game ends
         self.game_over = False
         self.kill_log: List[Tuple[str, str]] = []
+        self.damage_log: List[Tuple[str, str, int, bool]] = []
         self._cumulative_rewards = {a: 0.0 for a in self.possible_agents}
 
         self._spawn_ships()
@@ -130,23 +131,31 @@ class TeamAsteroidsEnv(ParallelEnv):
             self._step_physics()
             events = self._resolve_collisions()
             self.frame += 1
-            for shooter, victim in events:
-                self.kill_log.append((shooter, victim))
-                ind[victim] += rcfg.death
-                if shooter in self.ships:
-                    if self.team_of[shooter] == self.team_of[victim]:
-                        ind[shooter] += rcfg.teamkill
+            for source, victim, damage, killed in events:
+                self.damage_log.append((source, victim, damage, killed))
+                friendly = source in self.ships and self.team_of[source] == self.team_of[victim]
+                ind[victim] += rcfg.damage_taken * damage
+                if killed:
+                    self.kill_log.append((source, victim))
+                    ind[victim] += rcfg.death
+                if source in self.ships:
+                    if friendly:
+                        ind[source] += rcfg.teamdamage * damage
+                        if killed:
+                            ind[source] += rcfg.teamkill
                     else:
-                        ind[shooter] += rcfg.kill
+                        ind[source] += rcfg.damage_dealt * damage
+                        if killed:
+                            ind[source] += rcfg.kill
             if self.render_mode == "human":
                 self.render()
-            if self._team_alive(RED) == 0 or self._team_alive(BLUE) == 0 or self.frame >= cfg.max_frames:
+            if self._team_alive(RED) == 0 or self._team_alive(BLUE) == 0 or self._out_of_time():
                 break
         self.decision_step += 1
 
         red_alive, blue_alive = self._team_alive(RED), self._team_alive(BLUE)
         terminated = red_alive == 0 or blue_alive == 0
-        truncated = (not terminated) and self.frame >= cfg.max_frames
+        truncated = (not terminated) and self._out_of_time()
         self.game_over = terminated or truncated
 
         # Observations + potential-based shaping (phi of dead agents / terminal states is 0)
@@ -172,6 +181,11 @@ class TeamAsteroidsEnv(ParallelEnv):
                 self.winner = BLUE
             elif terminated and blue_alive == 0 and red_alive > 0:
                 self.winner = RED
+            elif truncated:
+                # Timeout tiebreak: the team that won the damage exchange takes it. Turns a flat
+                # zero-reward draw into a real gradient.
+                red_hp, blue_hp = self.team_hp(RED), self.team_hp(BLUE)
+                self.winner = RED if red_hp > blue_hp else (BLUE if blue_hp > red_hp else -1)
             else:
                 self.winner = -1
             for a in self.possible_agents:
@@ -296,6 +310,7 @@ class TeamAsteroidsEnv(ParallelEnv):
             ship.pos %= size
             if ship.cooldown > 0:
                 ship.cooldown -= 1
+            ship.tick_shield(self.config.shield_regen_delay, self.config.shield_regen_frames)
         for ast in self.asteroids:
             if ast.active:
                 ast.pos += ast.vel
@@ -309,9 +324,44 @@ class TeamAsteroidsEnv(ParallelEnv):
                 alive.append(b)
         self.bullets = alive
 
-    def _resolve_collisions(self) -> List[Tuple[str, str]]:
-        kill_events = []
+    def _separate(self, ship, delta, dist, overlap, push_both: bool, other=None):
+        """Push a contact apart along its normal and reflect the inbound velocity.
+
+        Without this, bodies stay overlapped and the contact re-triggers every frame.
+        """
+        # n points from ``ship`` toward the thing it hit.
+        n = np.array([delta[0] / dist, delta[1] / dist]) if dist > 1e-9 else np.array([1.0, 0.0])
+        gap = (overlap - dist) + 1.0
+        rest = self.config.bounce_restitution
+        size = np.array([self.width, self.height])
+        share = 0.5 if push_both else 1.0
+
+        def kick(s, direction):
+            """direction = -1 moves along -n (away, for ``ship``), +1 along +n (for ``other``)."""
+            s.pos = (s.pos + n * gap * share * direction) % size
+            vn = float(s.vel @ n)
+            if vn * direction < 0:  # only reflect the component closing on the contact
+                s.vel -= (1 + rest) * vn * n
+
+        kick(ship, -1.0)
+        if push_both and other is not None:
+            kick(other, 1.0)
+
+    def _resolve_collisions(self) -> List[Tuple[str, str, int, bool]]:
+        """Apply damage from all collisions.
+
+        Returns ``(source, victim, damage, killed)`` per hit. ``source`` is an agent name for
+        weapon fire, or "asteroid"/"ram" for environmental damage.
+        """
+        events: List[Tuple[str, str, int, bool]] = []
+        cfg = self.config
         new_asteroids = []
+
+        def hit(source: str, victim: str, amount: int):
+            ship = self.ships[victim]
+            dealt = ship.apply_damage(amount)
+            if dealt:
+                events.append((source, victim, dealt, not ship.active))
 
         # Bullets vs ships
         for b in self.bullets:
@@ -324,8 +374,7 @@ class TeamAsteroidsEnv(ParallelEnv):
                     continue
                 if self._wrapped_dist(b.pos, ship.pos) < b.radius + ship.radius:
                     b.active = False
-                    ship.active = False
-                    kill_events.append((b.owner_name, name))
+                    hit(b.owner_name, name, cfg.bullet_damage)
                     break
 
         # Bullets vs asteroids
@@ -351,17 +400,24 @@ class TeamAsteroidsEnv(ParallelEnv):
                                     self.config, size=ast.size - 1))
                     break
 
-        # Ships vs asteroids
+        # Ships vs asteroids: bounce off and take damage, gated by the collision cooldown so a
+        # lingering overlap cannot deal damage every frame.
         for name, ship in self.ships.items():
             if not ship.active:
                 continue
             for ast in self.asteroids:
-                if ast.active and self._wrapped_dist(ship.pos, ast.pos) < ship.radius + ast.radius:
-                    ship.active = False
-                    kill_events.append(("asteroid", name))
+                if not ast.active:
+                    continue
+                dx, dy, dist = self.wrapped_delta(ship.pos, ast.pos)
+                overlap = ship.radius + ast.radius
+                if dist < overlap:
+                    self._separate(ship, (dx, dy), dist, overlap, push_both=False)
+                    if ship.collision_cooldown <= 0:
+                        ship.collision_cooldown = cfg.collision_damage_cooldown
+                        hit("asteroid", name, cfg.asteroid_damage)
                     break
 
-        # Ships vs ships (ramming kills both, no kill credit)
+        # Ships vs ships (ramming damages both, no kill credit to either)
         names = list(self.ships)
         for i, na in enumerate(names):
             sa = self.ships[na]
@@ -369,14 +425,22 @@ class TeamAsteroidsEnv(ParallelEnv):
                 continue
             for nb in names[i + 1:]:
                 sb = self.ships[nb]
-                if sb.active and self._wrapped_dist(sa.pos, sb.pos) < sa.radius + sb.radius:
-                    sa.active = sb.active = False
-                    kill_events.extend([("ram", na), ("ram", nb)])
+                if not sb.active:
+                    continue
+                dx, dy, dist = self.wrapped_delta(sa.pos, sb.pos)
+                overlap = sa.radius + sb.radius
+                if dist < overlap:
+                    self._separate(sa, (dx, dy), dist, overlap, push_both=True, other=sb)
+                    if sa.collision_cooldown <= 0 and sb.collision_cooldown <= 0:
+                        sa.collision_cooldown = cfg.collision_damage_cooldown
+                        sb.collision_cooldown = cfg.collision_damage_cooldown
+                        hit("ram", na, cfg.ram_damage)
+                        hit("ram", nb, cfg.ram_damage)
                     break
 
         if self.asteroids_split:
             self.asteroids = [a for a in self.asteroids if a.active] + new_asteroids
-        return kill_events
+        return events
 
     # --------------------------------------------------------------- geometry
 
@@ -401,6 +465,13 @@ class TeamAsteroidsEnv(ParallelEnv):
 
     def _team_alive(self, team: int) -> int:
         return sum(1 for a in self.team_agents[team] if self.ships[a].active)
+
+    def team_hp(self, team: int) -> int:
+        """Total remaining hull + shield across a team (used for the timeout tiebreak)."""
+        return sum(self.ships[a].hp for a in self.team_agents[team] if self.ships[a].active)
+
+    def _out_of_time(self) -> bool:
+        return self.config.max_frames is not None and self.frame >= self.config.max_frames
 
     # ----------------------------------------------------------- observations
 
@@ -433,6 +504,8 @@ class TeamAsteroidsEnv(ParallelEnv):
         alive = np.array([s.active for s in ships])
         cd = np.array([s.cooldown / max(1, s.fire_rate) for s in ships])
         rad = np.array([s.radius for s in ships])
+        hull_f = np.array([s.hull / max(1, s.max_hull) for s in ships])
+        shield_f = np.array([s.shield / max(1, s.max_shield) if s.max_shield else 0.0 for s in ships])
         c, s_ = np.cos(A)[:, None], np.sin(A)[:, None]         # (S,1)
         H = np.stack([np.cos(A), np.sin(A)], axis=1)           # (S,2)
 
@@ -501,11 +574,13 @@ class TeamAsteroidsEnv(ParallelEnv):
         opp_alive = np.where(team == RED, blue_alive, red_alive)
         own_n = np.where(team == RED, self.n_red, self.m_blue)
         opp_n = np.where(team == RED, self.m_blue, self.n_red)
+        # No time limit -> no time pressure to represent, so the clock feature is pinned at full.
+        time_left = 1.0 if cfg.max_frames is None else 1.0 - self.frame / cfg.max_frames
         ego = np.stack([
             np.ones(S), Vr[:, 0] / cfg.max_speed, Vr[:, 1] / cfg.max_speed, cd,
             np.array([s.cooldown <= 0 for s in ships], dtype=float),
             (own_alive - 1) / np.maximum(1, own_n - 1), opp_alive / np.maximum(1, opp_n),
-            np.full(S, 1.0 - self.frame / cfg.max_frames),
+            np.full(S, time_left), hull_f, shield_f,
         ], axis=1)
         blocks.append(ego)
 
@@ -535,12 +610,18 @@ class TeamAsteroidsEnv(ParallelEnv):
         their_smiss = smiss.T
         Hr = rot(np.broadcast_to(H[None], (S, S, 2)))
 
+        # Target durability is broadcast along the target axis, so slot k reports that ship's health.
+        # Visible health is what makes focusing fire on a weakened enemy learnable.
+        hull_t = np.broadcast_to(hull_f[None], (S, S))
+        shield_t = np.broadcast_to(shield_f[None], (S, S))
         enemy_feats = np.concatenate([feats, np.stack([
             aim_cos, aim_sin, t_int_f, np.clip(smiss / SHOT_SCALE, -1, 1),
             their_aim, np.clip(their_smiss / SHOT_SCALE, -1, 1), np.broadcast_to(cd[None], (S, S)),
+            hull_t, shield_t,
         ], -1)], -1)
         ally_feats = np.concatenate([feats, np.stack([
             Hr[..., 0], Hr[..., 1], np.clip(smiss / SHOT_SCALE, -1, 1), np.broadcast_to(cd[None], (S, S)),
+            hull_t, shield_t,
         ], -1)], -1)
 
         eye = np.eye(S, dtype=bool)

@@ -41,16 +41,31 @@ def _steer(angle_diff, tol=0.1):
     return 2 if angle_diff > tol else (1 if angle_diff < -tol else 0)
 
 
-def heuristic_action(env, agent_name, rng, p: float = 1.0, danger_zone: float = 100.0):
+def heuristic_action(env, agent_name, rng, p: float = 1.0, danger_zone: float = 100.0,
+                     collision_margin: float = 3.5):
     """The original 'smart' bot: flee the nearest threat, otherwise turn to the enemy and shoot.
 
     With probability ``1 - p`` it does nothing this step (the legacy "p% optimal" knob).
+
+    ``collision_margin`` (in ego radii) adds a late break-off from imminent ship contact. Without it
+    the bot coasts straight into whatever it is shooting at and trades itself away by ramming, which
+    makes for a weak baseline.
     """
     if rng.random() > p:
         return NOOP.copy()
     ego = env.ships[agent_name]
     if not ego.active:
         return NOOP.copy()
+
+    # Imminent ship collision: thrust away from contact rather than coasting into it.
+    collide_r = ego.radius * collision_margin
+    for name, other in env.ships.items():
+        if name == agent_name or not other.active:
+            continue
+        dx, dy, d = env.wrapped_delta(ego.pos, other.pos)
+        if d < collide_r:
+            escape = _angle_diff(math.atan2(-dy, -dx), ego.angle)
+            return np.array([1 if abs(escape) < 1.2 else 0, _steer(escape), 0])
 
     closest, tdx, tdy = float("inf"), 0.0, 0.0
     for ast in env.asteroids:

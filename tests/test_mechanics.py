@@ -79,7 +79,8 @@ def test_mirrored_eval_requires_symmetric_teams():
 @pytest.mark.parametrize("name", [n for n in SCENARIOS if n.startswith("demo_")])
 def test_static_scenarios_are_exactly_symmetric(name):
     """180-degree rotation maps red onto blue, so identical deterministic policies must draw."""
-    cfg = get_scenario(name)
+    # Demo scenarios have no time limit by design; cap it here so the test terminates.
+    cfg = get_scenario(name, max_frames=1500)
     stats = play_matches(cfg, make_scripted("heuristic_1.0"), make_scripted("heuristic_1.0"),
                          3, n_parallel=3, seed=0)
     assert stats.blue_wins == 0 and stats.red_wins == 0, "one side has an advantage"
@@ -312,15 +313,17 @@ def test_scale_map_keeps_static_layouts_symmetric():
 @pytest.mark.parametrize("name", ["duel_large", "team2_large", "team3_large", "team3_huge",
                                   "demo_team2_large"])
 def test_large_scenarios_are_playable(name):
-    cfg = get_scenario(name)
+    cfg = get_scenario(name, max_frames=2500)
     assert cfg.width > 1200
     stats = play_matches(cfg, make_scripted("heuristic_1.0", 0), make_scripted("heuristic_1.0", 1),
                          4, n_parallel=4, seed=0)
     assert stats.games == 4
-    assert sum(stats.kills.values()) > 0, "bots cannot find each other on this map"
+    # Damage, not kills: on a perfectly symmetric static map identical policies trade simultaneously
+    # and can finish each other by ramming, which carries no shooter credit.
+    assert sum(stats.damage.values()) > 0, "bots cannot find each other on this map"
 
 
 def test_static_large_scenario_is_still_symmetric():
-    stats = play_matches(get_scenario("demo_team2_large"), make_scripted("heuristic_1.0"),
+    stats = play_matches(get_scenario("demo_team2_large", max_frames=2000), make_scripted("heuristic_1.0"),
                          make_scripted("heuristic_1.0"), 2, n_parallel=2, seed=0)
     assert stats.blue_wins == 0 and stats.red_wins == 0

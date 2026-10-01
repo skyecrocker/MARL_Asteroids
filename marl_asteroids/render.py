@@ -53,12 +53,14 @@ class RenderState:
     last_frame: int = -1
     prev_bullets: int = 0
     dead_seen: set = field(default_factory=set)
+    prev_hp: dict = field(default_factory=dict)
+    flash: dict = field(default_factory=dict)  # agent -> frames of damage flash remaining
 
 
 class Renderer:
     def __init__(self, env, window: int = 1000, show_hud: bool = True, effects: bool = True,
                  trail_length: int = 18, follow: Optional[str] = None, view_size: float = 1200.0,
-                 minimap: bool = True):
+                 minimap: bool = True, show_obs: bool = False, obs_agent: Optional[str] = None):
         """
         Args:
             follow: agent name to keep centered. None renders the whole map scaled to the window.
@@ -72,6 +74,8 @@ class Renderer:
         self.trail_length = trail_length
         self.follow = follow
         self.minimap = minimap
+        self.show_obs = show_obs      # toggled live with Tab in watch.py
+        self.obs_agent = obs_agent    # whose observation to draw; defaults to the followed ship
         map_span = max(env.width, env.height)
         if follow is None:
             self.view_size = map_span
@@ -209,8 +213,17 @@ class Renderer:
                 life, life * (0.6 + 0.4 * self.rng.random()), radius, color, kind))
 
     def _detect_events(self):
-        """Infer cosmetic events from env state (deaths, new bullets) without touching the env."""
+        """Infer cosmetic events from env state (hits, deaths, new bullets) without touching it."""
         env, st = self.env, self.state
+        for name, ship in env.ships.items():
+            prev = st.prev_hp.get(name)
+            if prev is not None and ship.hp < prev and ship.active:
+                st.flash[name] = 6
+                c = TEAM_COLORS[ship.team_id]
+                self._spawn_burst(ship.pos[0], ship.pos[1], 10, 2.0, (255, 240, 200), 12, 2.0)
+                st.shake = min(10.0, st.shake + 3.0)
+            st.prev_hp[name] = ship.hp
+            st.flash[name] = max(0, st.flash.get(name, 0) - 1)
         for name, ship in env.ships.items():
             if not ship.active and name not in st.dead_seen:
                 st.dead_seen.add(name)
@@ -368,7 +381,10 @@ class Renderer:
                         for o in (0.85, -0.85)]
                 pygame.draw.polygon(surf, (255, int(150 + 80 * flick), 60),
                                     [to_px(side[0]), to_px(tip), to_px(side[1]), to_px(base)])
-            pygame.draw.polygon(surf, col["hull"], hull)
+            body = col["hull"]
+            if self.effects and st.flash.get(name, 0) > 0:  # white flash on taking damage
+                body = (255, 255, 255)
+            pygame.draw.polygon(surf, body, hull)
             # Bright outline while armed, dim while reloading: readable weapon state at a glance.
             armed = ship.cooldown <= 0
             edge = (250, 250, 255) if armed else tuple(int(c * 0.45) for c in col["hull"])
@@ -378,7 +394,12 @@ class Renderer:
                 nose = ship.pos + (math.cos(a) * r * 1.45, math.sin(a) * r * 1.45)
                 pygame.draw.circle(surf, tuple(int(c * frac) for c in col["glow"]),
                                    to_px(nose), max(1, int(2.6 * s * frac)))
+            self._draw_health_bar(surf, ship, to_px)
 
+        if self.show_obs:
+            agent = self.obs_agent or self.follow or next(iter(env.ships), None)
+            if agent is not None:
+                self._draw_obs_overlay(surf, to_px, agent)
         if self.follow is not None:
             self._highlight_followed(surf, to_px)
             if self.minimap:
@@ -394,6 +415,30 @@ class Renderer:
             self.clock.tick(fps)
             return None
         return np.transpose(np.array(pygame.surfarray.pixels3d(surf)), (1, 0, 2)).copy()
+
+    def _draw_health_bar(self, surf, ship, to_px):
+        """Segmented bar above the ship: hull blocks plus shield blocks."""
+        import pygame
+
+        if ship.max_hp <= 0:
+            return
+        px, py = to_px(ship.pos)
+        seg = max(3, int(5 * self.scale))
+        gap = max(1, int(1.5 * self.scale))
+        total = ship.max_hp * seg + (ship.max_hp - 1) * gap
+        x0 = px - total // 2
+        y0 = py - int(ship.radius * self.scale) - max(7, int(9 * self.scale))
+        h = max(2, int(3 * self.scale))
+        for i in range(ship.max_hp):
+            filled_hull = i < ship.hull
+            is_shield_slot = i >= ship.max_hull
+            if is_shield_slot:
+                filled = (i - ship.max_hull) < ship.shield
+                color = (110, 220, 255) if filled else (34, 48, 62)
+            else:
+                color = ((120, 230, 140) if ship.hull > 1 else (255, 120, 110)) if filled_hull \
+                    else (56, 40, 44)
+            pygame.draw.rect(surf, color, (x0 + i * (seg + gap), y0, seg, h))
 
     def _wrapped_delta(self, a, b):
         w, h = self.env.width, self.env.height
@@ -468,29 +513,102 @@ class Renderer:
             pygame.draw.circle(surf, col, mp(ship.pos), 3 if name == self.follow else 2)
             if name == self.follow:
                 pygame.draw.circle(surf, (255, 255, 255), mp(ship.pos), 5, 1)
-        # Viewport box, drawn in up to four pieces so it wraps with the torus
+        # Viewport box, tiled so it wraps with the torus. Uses a clip region rather than clipping the
+        # rects themselves, which would draw false edges along the panel border.
         vs = self.view_size * k
         bx, by = cam[0] * k - vs / 2, cam[1] * k - vs / 2
+        prev_clip = surf.get_clip()
+        surf.set_clip(pygame.Rect(x0, y0, side, side))
         for gx in (bx, bx + side, bx - side):
             for gy in (by, by + side, by - side):
-                r = pygame.Rect(int(x0 + gx), int(y0 + gy), int(vs), int(vs))
-                clipped = r.clip(pygame.Rect(x0, y0, side, side))
-                if clipped.width > 1 and clipped.height > 1:
-                    pygame.draw.rect(surf, (200, 210, 235), clipped, 1)
+                pygame.draw.rect(surf, (200, 210, 235),
+                                 pygame.Rect(int(x0 + gx), int(y0 + gy), int(vs), int(vs)), 1)
+        surf.set_clip(prev_clip)
+
+    def _draw_obs_overlay(self, surf, to_px, agent: str):
+        """Draw the observation vector decoded back into world space.
+
+        This is the agent's own view, reconstructed from the numbers the policy receives, so it both
+        documents exactly what the agent knows and doubles as a debugging tool. Range is recovered by
+        inverting ``dist / (dist + sensor_range)``, and bearing is rotated out of the ego frame.
+        """
+        import pygame
+
+        from .env import (ALLY_DIM, ASTEROID_DIM, BASE_DIM, BULLET_DIM, EGO_DIM, ENEMY_DIM)
+
+        env = self.env
+        ship = env.ships.get(agent)
+        if ship is None or not ship.active:
+            return
+        obs = env.get_obs(agent)
+        cfg = env.config
+        L = cfg.sensor_range
+
+        # Sensor scale ring: where the range feature reads 0.5
+        pygame.draw.circle(surf, (58, 74, 96), to_px(ship.pos), int(L * self.scale), 1)
+
+        blocks = [("enemy", cfg.obs_enemies, ENEMY_DIM, (255, 110, 100)),
+                  ("ally", cfg.obs_allies, ALLY_DIM, (110, 190, 255)),
+                  ("rock", cfg.obs_asteroids, ASTEROID_DIM, (170, 166, 186)),
+                  ("bullet", cfg.obs_bullets, BULLET_DIM, (255, 226, 120))]
+        off = EGO_DIM
+        for kind, count, dim, color in blocks:
+            for k in range(count):
+                slot = obs[off + k * dim: off + (k + 1) * dim]
+                if slot.size < BASE_DIM or slot[0] <= 0.5:
+                    continue
+                bx, by, r = float(slot[1]), float(slot[2]), float(min(slot[3], 0.999))
+                dist = r * L / max(1e-6, 1.0 - r)
+                world_ang = ship.angle + math.atan2(by, bx)
+                pos = (ship.pos[0] + math.cos(world_ang) * dist,
+                       ship.pos[1] + math.sin(world_ang) * dist)
+                px = to_px(pos)
+                size = 7 if kind in ("enemy", "ally") else 4
+                pygame.draw.circle(surf, color, px, size, 1)
+                # Slot rank, so it is obvious which contact occupies which observation slot
+                if kind in ("enemy", "ally"):
+                    surf.blit(self.font_small.render(str(k), True, color), (px[0] + 8, px[1] - 6))
+                    # Relative velocity in the ego frame, rotated back to world
+                    vref = 2 * cfg.max_speed + cfg.bullet_speed
+                    rvx, rvy = float(slot[4]) * vref, float(slot[5]) * vref
+                    ca, sa = math.cos(ship.angle), math.sin(ship.angle)
+                    wvx, wvy = ca * rvx - sa * rvy, sa * rvx + ca * rvy
+                    pygame.draw.line(surf, tuple(int(c * 0.7) for c in color), px,
+                                     to_px((pos[0] + wvx * 5, pos[1] + wvy * 5)), 1)
+            off += count * dim
+
+        # Ego readouts, in the same units the policy sees
+        vfwd, vlat = float(obs[1]), float(obs[2])
+        lines = [f"obs view: {agent}",
+                 f"v_fwd {vfwd:+.2f}  v_lat {vlat:+.2f}",
+                 f"reload {float(obs[3]):.2f}  armed {int(obs[4] > 0.5)}",
+                 f"allies {float(obs[5]):.2f}  enemies {float(obs[6]):.2f}",
+                 f"time_left {float(obs[7]):.2f}",
+                 f"hull {float(obs[8]):.2f}  shield {float(obs[9]):.2f}"]
+        panel = pygame.Surface((196, 16 * len(lines) + 10))
+        panel.set_alpha(170)
+        panel.fill((8, 10, 20))
+        surf.blit(panel, (12, 52))
+        for i, line in enumerate(lines):
+            surf.blit(self.font_small.render(line, True, (198, 210, 230)), (20, 58 + i * 16))
 
     def _draw_hud(self, surf):
         env = self.env
-        red, blue = env._team_alive(RED), env._team_alive(BLUE)
-        surf.blit(self.font.render(f"RED {red}", True, TEAM_COLORS[RED]["hull"]), (14, 12))
-        label = self.font.render(f"BLUE {blue}", True, TEAM_COLORS[BLUE]["hull"])
-        surf.blit(label, (surf.get_width() - label.get_width() - 14, 12))
-        t = self.font.render(f"{env.frame}/{env.config.max_frames}", True, HUD_DIM)
-        surf.blit(t, ((surf.get_width() - t.get_width()) // 2, 12))
-        bar_w = surf.get_width() - 28
-        frac = min(1.0, env.frame / max(1, env.config.max_frames))
         import pygame
-        pygame.draw.rect(surf, (40, 44, 60), (14, 34, bar_w, 3))
-        pygame.draw.rect(surf, HUD_DIM, (14, 34, int(bar_w * frac), 3))
+
+        red, blue = env._team_alive(RED), env._team_alive(BLUE)
+        surf.blit(self.font.render(f"RED {red}  hp {env.team_hp(RED)}", True,
+                                   TEAM_COLORS[RED]["hull"]), (14, 12))
+        label = self.font.render(f"hp {env.team_hp(BLUE)}  BLUE {blue}", True, TEAM_COLORS[BLUE]["hull"])
+        surf.blit(label, (surf.get_width() - label.get_width() - 14, 12))
+        limit = env.config.max_frames
+        t = self.font.render(f"{env.frame}" if limit is None else f"{env.frame}/{limit}", True, HUD_DIM)
+        surf.blit(t, ((surf.get_width() - t.get_width()) // 2, 12))
+        if limit is not None:  # no clock bar when the game has no time limit
+            bar_w = surf.get_width() - 28
+            frac = min(1.0, env.frame / max(1, limit))
+            pygame.draw.rect(surf, (40, 44, 60), (14, 34, bar_w, 3))
+            pygame.draw.rect(surf, HUD_DIM, (14, 34, int(bar_w * frac), 3))
         if env.game_over:
             msg = {BLUE: "BLUE WINS", RED: "RED WINS"}.get(env.winner, "DRAW")
             color = TEAM_COLORS.get(env.winner, {}).get("hull", HUD_TEXT)

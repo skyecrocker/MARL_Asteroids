@@ -23,12 +23,12 @@ def run_random(env, steps, seed=0):
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
 def test_parallel_api(name):
-    parallel_api_test(TeamAsteroidsEnv(get_scenario(name)), num_cycles=200)
+    parallel_api_test(TeamAsteroidsEnv(get_scenario(name, max_frames=600)), num_cycles=200)
 
 
 def test_obs_shape_and_bounds():
     for name in SCENARIOS:
-        env = TeamAsteroidsEnv(get_scenario(name))
+        env = TeamAsteroidsEnv(get_scenario(name, max_frames=600))
         for _, obs, _ in run_random(env, 300):
             for o in obs.values():
                 assert o.shape == (obs_dim(env.config),)
@@ -85,7 +85,10 @@ def test_ally_slots_exclude_self():
 
 
 def test_teamkill_is_penalized_not_rewarded():
-    cfg = _no_shaping(GameConfig(n_red=1, m_blue=2, num_asteroids=0, friendly_fire=True))
+    # 1 hull / 0 shield so a single bullet resolves the kill: this test is about reward attribution,
+    # not durability (health behavior is covered in test_health.py).
+    cfg = _no_shaping(GameConfig(n_red=1, m_blue=2, num_asteroids=0, friendly_fire=True,
+                                 max_hull=1, max_shield=0))
     cfg.rewards.team_spirit = 0.0
     env = TeamAsteroidsEnv(cfg)
     env.reset(seed=0)
@@ -101,14 +104,16 @@ def test_teamkill_is_penalized_not_rewarded():
         acts = {a: [0, 0, 0] for a in env.agents}
         if not env.ships["blue_1"].active:
             break
+    rc = cfg.rewards
     assert ("blue_0", "blue_1") in env.kill_log
     assert not env.game_over
-    assert total["blue_0"] == pytest.approx(cfg.rewards.teamkill)
-    assert total["blue_1"] == pytest.approx(cfg.rewards.death)
+    assert total["blue_0"] == pytest.approx(rc.teamkill + rc.teamdamage)
+    assert total["blue_1"] == pytest.approx(rc.death + rc.damage_taken)
+    assert total["blue_0"] < 0  # friendly fire must never pay like a kill
 
 
 def test_kill_reward_win_and_dead_teammate_gets_outcome():
-    cfg = _no_shaping(GameConfig(n_red=1, m_blue=2, num_asteroids=0))
+    cfg = _no_shaping(GameConfig(n_red=1, m_blue=2, num_asteroids=0, max_hull=1, max_shield=0))
     cfg.rewards.team_spirit = 0.5
     env = TeamAsteroidsEnv(cfg)
     env.reset(seed=0)
@@ -124,11 +129,12 @@ def test_kill_reward_win_and_dead_teammate_gets_outcome():
         env.step({a: [0, 0, 0] for a in env.agents})
     assert env.game_over and env.winner == BLUE
     rc = cfg.rewards
-    # shooter: (1-ts)*kill + ts*mean(kill, 0) + win
-    assert env.rewards_all["blue_0"] == pytest.approx((1 - 0.5) * rc.kill + 0.5 * rc.kill / 2 + rc.win)
-    # dead teammate still receives team-spirit share + win
-    assert env.rewards_all["blue_1"] == pytest.approx(0.5 * rc.kill / 2 + rc.win)
-    assert env.rewards_all["red_0"] == pytest.approx(rc.death + rc.loss)
+    shooter_ind = rc.kill + rc.damage_dealt  # final blow pays the damage term and the kill bonus
+    # shooter: (1-ts)*ind + ts*mean(ind, 0) + win
+    assert env.rewards_all["blue_0"] == pytest.approx(0.5 * shooter_ind + 0.5 * shooter_ind / 2 + rc.win)
+    # dead teammate still receives its team-spirit share + the win
+    assert env.rewards_all["blue_1"] == pytest.approx(0.5 * shooter_ind / 2 + rc.win)
+    assert env.rewards_all["red_0"] == pytest.approx(rc.death + rc.damage_taken + rc.loss)
 
 
 def test_entities_use_instance_config():

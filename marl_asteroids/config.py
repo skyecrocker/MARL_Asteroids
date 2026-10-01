@@ -49,6 +49,13 @@ class RewardConfig:
     draw: float = 0.0
     team_spirit: float = 0.5
 
+    # Per-point-of-damage terms. These keep the signal from going sparse now that a kill takes
+    # several hits, and they reward winning the damage exchange even without a kill. Kept small
+    # relative to ``kill`` so finishing a target always beats chipping several.
+    damage_dealt: float = 0.15
+    damage_taken: float = -0.15
+    teamdamage: float = -0.15  # Applied to the shooter for friendly-fire damage
+
     # Potential-based shaping F = gamma * phi(s') - phi(s); preserves the optimal policy.
     shaping_scale: float = 0.1
     shaping_gamma: float = 0.995  # Should match the learner's discount
@@ -105,8 +112,28 @@ class GameConfig:
     # never separate and sit stacked on the parent's position.
     asteroid_split_min_speed: float = 0.7
 
-    # Episode
-    max_frames: int = 1200     # Truncation limit in physics frames
+    # Durability. A ship absorbs ``max_shield + max_hull`` damage before dying. Shield takes damage
+    # first and regenerates after ``shield_regen_delay`` frames without being hit, so disengaging to
+    # recover is a real option; hull damage is permanent.
+    max_hull: int = 3
+    max_shield: int = 1
+    shield_regen_delay: int = 180   # Frames without damage before the shield starts coming back
+    shield_regen_frames: int = 60   # Frames per shield point restored
+    bullet_damage: int = 1
+    asteroid_damage: int = 2        # Rocks are heavy: half a ship's health per impact
+    # Ramming is mutual, so making it a two-hit kill lets both sides trade themselves away and
+    # removes tactical depth. Kept light so bumping is a real cost but shooting stays the way to kill.
+    ram_damage: int = 1
+    # Overlapping bodies would otherwise re-trigger collision damage every frame, which kills a
+    # full-health ship in two frames and makes collisions lethal again. Contacts bounce apart, and
+    # this cooldown gates *collision* damage only (bullets are consumed on impact, so they can
+    # never double-hit).
+    collision_damage_cooldown: int = 45
+    bounce_restitution: float = 0.85
+
+    # Episode. ``max_frames=None`` means no truncation at all (used by the demo scenarios so a
+    # human game never ends on a clock). Training scenarios must keep a limit.
+    max_frames: Optional[int] = 1200
     action_repeat: int = 2     # Physics frames per agent decision
 
     # Observation length scale (px). Relative positions/distances are normalized by this and
@@ -177,9 +204,10 @@ def static_battle(n: int, width: float, height: float, asteroids: Sequence[tuple
 # readable on screen. Difficulty for human play comes mainly from the AI handicaps in
 # set_team_fire_rate / policies.DelayedPolicy, not from map size alone.
 DEMO_W = DEMO_H = 1200.0
+# max_frames=None: demo and human games never end on a clock.
 DEMO_SCALE = dict(ship_radius=15.0, bullet_radius=3.5, max_speed=4.5,
                   asteroid_large_radius=38.0, asteroid_medium_radius=20.0, asteroid_small_radius=10.0,
-                  max_frames=2000, min_spawn_dist=220.0)
+                  max_frames=None, min_spawn_dist=220.0)
 _DEMO_ROCKS = [
     (DEMO_W * 0.5, DEMO_H * 0.25, 0.0, 0.35, 3),
     (DEMO_W * 0.5, DEMO_H * 0.75, 0.0, -0.35, 3),
@@ -211,7 +239,7 @@ def scale_map(config: GameConfig, factor: float, asteroid_density: float = 1.0,
     return config.replace(
         width=config.width * factor,
         height=config.height * factor,
-        max_frames=int(config.max_frames * factor),
+        max_frames=None if config.max_frames is None else int(config.max_frames * factor),
         min_spawn_dist=config.min_spawn_dist * factor,
         # Never drop below the explicitly placed rocks, so static layouts stay static.
         num_asteroids=max(round(config.num_asteroids * factor * asteroid_density),

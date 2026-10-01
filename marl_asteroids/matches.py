@@ -21,6 +21,8 @@ class MatchStats:
     kills: Dict[str, int] = field(default_factory=lambda: {"blue": 0, "red": 0})
     teamkills: Dict[str, int] = field(default_factory=lambda: {"blue": 0, "red": 0})
     env_deaths: Dict[str, int] = field(default_factory=lambda: {"blue": 0, "red": 0})  # asteroid/ram
+    damage: Dict[str, int] = field(default_factory=lambda: {"blue": 0, "red": 0})
+    focused_damage: Dict[str, int] = field(default_factory=lambda: {"blue": 0, "red": 0})
 
     @property
     def games(self) -> int:
@@ -47,6 +49,9 @@ class MatchStats:
             "blue_kills_per_game": self.kills["blue"] / n,
             "blue_teamkills_per_game": self.teamkills["blue"] / n,
             "blue_env_deaths_per_game": self.env_deaths["blue"] / n,
+            "blue_damage_per_game": self.damage["blue"] / n,
+            # Share of blue's damage landed on an already-wounded target: a focus-fire proxy
+            "blue_focus_fire_rate": self.focused_damage["blue"] / max(1, self.damage["blue"]),
         }
 
 
@@ -59,7 +64,7 @@ def record_game(env: TeamAsteroidsEnv, stats: MatchStats):
         stats.blue_wins += 1
     elif env.winner == RED:
         stats.red_wins += 1
-    elif env.frame >= env.config.max_frames:
+    elif env.config.max_frames is not None and env.frame >= env.config.max_frames:
         stats.draws_timeout += 1
     else:
         stats.draws_mutual += 1
@@ -70,6 +75,17 @@ def record_game(env: TeamAsteroidsEnv, stats: MatchStats):
             getattr(stats, key)[_team_str(shooter)] += 1
         else:
             stats.env_deaths[_team_str(victim)] += 1
+
+    # Damage and focus fire. "Focused" damage is any hit on a target that had already lost health,
+    # which is the observable signature of two agents working the same enemy.
+    seen_damage: Dict[str, int] = {}
+    for source, victim, amount, _killed in env.damage_log:
+        if source in env.ships and _team_str(source) != _team_str(victim):
+            team = _team_str(source)
+            stats.damage[team] += amount
+            if seen_damage.get(victim, 0) > 0:
+                stats.focused_damage[team] += amount
+        seen_damage[victim] = seen_damage.get(victim, 0) + amount
 
 
 def play_matches_mirrored(config: GameConfig, a: Policy, b: Policy, n_games: int,
@@ -96,7 +112,7 @@ def _merge_swapped(first: MatchStats, second: MatchStats) -> MatchStats:
     m.draws_timeout = first.draws_timeout + second.draws_timeout
     m.draws_mutual = first.draws_mutual + second.draws_mutual
     m.lengths = first.lengths + second.lengths
-    for field in ("kills", "teamkills", "env_deaths"):
+    for field in ("kills", "teamkills", "env_deaths", "damage", "focused_damage"):
         fa, fb = getattr(first, field), getattr(second, field)
         getattr(m, field)["blue"] = fa["blue"] + fb["red"]
         getattr(m, field)["red"] = fa["red"] + fb["blue"]

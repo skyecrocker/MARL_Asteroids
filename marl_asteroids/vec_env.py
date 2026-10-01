@@ -106,7 +106,7 @@ class TeamVecEnv(VecEnv):
                     score, key = 0.5, "draw"
                 self.outcomes[key] += 1
                 self.pool.report(self.opponents[g].id, score)
-                truncated = env.winner == -1 and env.frame >= env.config.max_frames
+                truncated = env.winner is not None and env._out_of_time()
                 for k in self.game_slots[g]:
                     dones[k] = True
                     infos[k]["terminal_observation"] = obs[k].copy()

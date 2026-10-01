@@ -48,6 +48,10 @@ def main():
     ap.add_argument("--view", type=float, default=1200.0,
                     help="World units across the viewport in follow mode")
     ap.add_argument("--no-minimap", action="store_true")
+    ap.add_argument("--show-obs", action="store_true",
+                    help="Overlay the observation the agent actually receives (Tab toggles live)")
+    ap.add_argument("--obs-agent", default=None,
+                    help="Whose observation to overlay (defaults to the followed ship)")
     ap.add_argument("--no-effects", action="store_true", help="Disable particles/trails/flames")
     ap.add_argument("--difficulty", choices=sorted(DIFFICULTY), default=None,
                     help="Handicap the non-human side (defaults to 'normal' when one side is human)")
@@ -104,7 +108,8 @@ def main():
 
     env = TeamAsteroidsEnv(cfg, render_mode="rgb_array" if args.record else "human",
                            window=args.window, effects=not args.no_effects,
-                           follow=follow, view_size=args.view, minimap=not args.no_minimap)
+                           follow=follow, view_size=args.view, minimap=not args.no_minimap,
+                           show_obs=args.show_obs, obs_agent=args.obs_agent)
     frames = []
     try:
         for game in range(args.games):
@@ -119,6 +124,9 @@ def main():
                         if event.type == pygame.QUIT or (
                                 event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
                             running = False
+                        elif event.type == pygame.KEYDOWN and event.key == pygame.K_TAB \
+                                and env.renderer is not None:
+                            env.renderer.show_obs = not env.renderer.show_obs
                 groups = {}
                 for a in env.agents:
                     pol = policies[a]
