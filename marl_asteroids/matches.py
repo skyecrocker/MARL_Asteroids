@@ -23,6 +23,8 @@ class MatchStats:
     env_deaths: Dict[str, int] = field(default_factory=lambda: {"blue": 0, "red": 0})  # asteroid/ram
     damage: Dict[str, int] = field(default_factory=lambda: {"blue": 0, "red": 0})
     focused_damage: Dict[str, int] = field(default_factory=lambda: {"blue": 0, "red": 0})
+    weapon_kills: Dict[str, int] = field(default_factory=lambda: {"blue": 0, "red": 0})
+    shared_kills: Dict[str, int] = field(default_factory=lambda: {"blue": 0, "red": 0})
 
     @property
     def games(self) -> int:
@@ -50,8 +52,11 @@ class MatchStats:
             "blue_teamkills_per_game": self.teamkills["blue"] / n,
             "blue_env_deaths_per_game": self.env_deaths["blue"] / n,
             "blue_damage_per_game": self.damage["blue"] / n,
-            # Share of blue's damage landed on an already-wounded target: a focus-fire proxy
+            # Share of blue's damage landed on an already-wounded target. Concentration, not teamwork:
+            # saturates at 0.75 for any 4-hit kill, even solo.
             "blue_focus_fire_rate": self.focused_damage["blue"] / max(1, self.damage["blue"]),
+            # Share of blue's weapon kills where 2+ blue ships damaged the victim: actual cooperation.
+            "blue_shared_kill_rate": self.shared_kills["blue"] / max(1, self.weapon_kills["blue"]),
         }
 
 
@@ -76,16 +81,26 @@ def record_game(env: TeamAsteroidsEnv, stats: MatchStats):
         else:
             stats.env_deaths[_team_str(victim)] += 1
 
-    # Damage and focus fire. "Focused" damage is any hit on a target that had already lost health,
-    # which is the observable signature of two agents working the same enemy.
+    # Damage concentration: hits on a target that had already lost health. This measures whether
+    # damage is concentrated, NOT cooperation: one agent finishing its own target scores the same as
+    # two agents sharing it (any 4-hit kill gives 0.75). Use the shared-kill metric below for teamwork.
     seen_damage: Dict[str, int] = {}
-    for source, victim, amount, _killed in env.damage_log:
+    contributors: Dict[str, set] = {}  # victim -> enemy ships that damaged it
+    for source, victim, amount, killed in env.damage_log:
         if source in env.ships and _team_str(source) != _team_str(victim):
             team = _team_str(source)
             stats.damage[team] += amount
             if seen_damage.get(victim, 0) > 0:
                 stats.focused_damage[team] += amount
+            contributors.setdefault(victim, set()).add(source)
         seen_damage[victim] = seen_damage.get(victim, 0) + amount
+        # Shared kills: an enemy killed by weapon fire after taking damage from 2+ distinct ships of
+        # the killing team. This requires a teammate, so it is identically 0 in a 1v1.
+        if killed and source in env.ships and _team_str(source) != _team_str(victim):
+            team = _team_str(source)
+            stats.weapon_kills[team] += 1
+            if len(contributors.get(victim, ())) >= 2:
+                stats.shared_kills[team] += 1
 
 
 def play_matches_mirrored(config: GameConfig, a: Policy, b: Policy, n_games: int,
@@ -112,7 +127,8 @@ def _merge_swapped(first: MatchStats, second: MatchStats) -> MatchStats:
     m.draws_timeout = first.draws_timeout + second.draws_timeout
     m.draws_mutual = first.draws_mutual + second.draws_mutual
     m.lengths = first.lengths + second.lengths
-    for field in ("kills", "teamkills", "env_deaths", "damage", "focused_damage"):
+    for field in ("kills", "teamkills", "env_deaths", "damage", "focused_damage",
+                  "weapon_kills", "shared_kills"):
         fa, fb = getattr(first, field), getattr(second, field)
         getattr(m, field)["blue"] = fa["blue"] + fb["red"]
         getattr(m, field)["red"] = fa["red"] + fb["blue"]

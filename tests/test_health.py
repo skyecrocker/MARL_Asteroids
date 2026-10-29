@@ -287,3 +287,33 @@ def test_focus_fire_metric_counts_hits_on_wounded_targets():
     assert stats.damage["blue"] == 4
     assert stats.focused_damage["blue"] == 3
     assert stats.summary()["blue_focus_fire_rate"] == pytest.approx(0.75)
+    assert stats.weapon_kills["blue"] == 1 and stats.shared_kills["blue"] == 1  # two contributors
+
+
+def test_solo_kill_is_not_a_shared_kill():
+    """Regression: the concentration metric saturates on a solo kill; the shared metric must not."""
+    from marl_asteroids.matches import MatchStats, record_game
+    cfg = GameConfig(n_red=1, m_blue=2, num_asteroids=0, max_frames=10)
+    env = TeamAsteroidsEnv(cfg)
+    env.reset(seed=0)
+    env.winner = BLUE
+    env.damage_log = [("blue_0", "red_0", 1, False), ("blue_0", "red_0", 1, False),
+                      ("blue_0", "red_0", 1, False), ("blue_0", "red_0", 1, True)]
+    stats = MatchStats()
+    record_game(env, stats)
+    s = stats.summary()
+    assert s["blue_focus_fire_rate"] == pytest.approx(0.75)  # looks "focused"...
+    assert s["blue_shared_kill_rate"] == 0.0                 # ...but nobody helped
+
+
+def test_environment_kills_are_not_counted_as_shared():
+    from marl_asteroids.matches import MatchStats, record_game
+    cfg = GameConfig(n_red=1, m_blue=2, num_asteroids=0, max_frames=10)
+    env = TeamAsteroidsEnv(cfg)
+    env.reset(seed=0)
+    env.winner = BLUE
+    env.damage_log = [("blue_0", "red_0", 1, False), ("blue_1", "red_0", 1, False),
+                      ("asteroid", "red_0", 2, True)]
+    stats = MatchStats()
+    record_game(env, stats)
+    assert stats.weapon_kills["blue"] == 0 and stats.shared_kills["blue"] == 0

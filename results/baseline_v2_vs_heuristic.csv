@@ -1,0 +1,9 @@
+scenario,blue,red,mirrored,games,blue_win_rate,red_win_rate,draw_timeout_rate,draw_mutual_rate,avg_frames,blue_kills_per_game,blue_teamkills_per_game,blue_env_deaths_per_game,blue_damage_per_game,blue_focus_fire_rate
+duel,models/baseline_v2/best_model.zip,heuristic_1.0,True,200,1.0,0.0,0.0,0.0,135.805,0.995,0.0,0.0,3.99,0.7494
+duel,heuristic_1.0,heuristic_1.0,True,200,0.265,0.265,0.43,0.04,792.32,0.1,0.0,0.105,1.36,0.4816
+duel_rocks,models/baseline_v2/best_model.zip,heuristic_1.0,True,200,0.985,0.015,0.0,0.0,142.775,0.97,0.0,0.005,3.895,0.7471
+duel_rocks,heuristic_1.0,heuristic_1.0,True,200,0.43,0.43,0.1,0.04,627.86,0.18,0.0,0.205,1.79,0.5615
+team2,models/baseline_v2/best_model.zip,heuristic_1.0,True,200,0.985,0.01,0.0,0.005,183.83,1.795,0.035,0.045,7.08,0.7394
+team2,heuristic_1.0,heuristic_1.0,True,200,0.46,0.46,0.06,0.02,770.61,0.54,0.08,0.555,3.505,0.6234
+team3,models/baseline_v2/best_model.zip,heuristic_1.0,True,200,0.995,0.0,0.0,0.005,217.33,2.53,0.11,0.235,10.185,0.7324
+team3,heuristic_1.0,heuristic_1.0,True,200,0.475,0.475,0.05,0.0,762.3,0.765,0.175,1.1,4.915,0.6195
