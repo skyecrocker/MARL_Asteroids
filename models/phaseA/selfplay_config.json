@@ -1,0 +1,37 @@
+{
+ "args": {
+  "preset": "selfplay",
+  "run": "selfplay_v2",
+  "timesteps": 20000000.0,
+  "init": null,
+  "seed": 0,
+  "eval_every": 2000000.0,
+  "eval_games": 100,
+  "n_steps": 256,
+  "lr": 0.0003,
+  "ent_coef": 0.01,
+  "gamma": 0.995,
+  "team_spirit": null,
+  "shaping_scale": null,
+  "threads": 4,
+  "workers": 11,
+  "games_mult": 3
+ },
+ "preset": {
+  "mix": {
+   "duel": 6,
+   "duel_rocks": 6,
+   "team2": 6,
+   "team3": 4,
+   "team2_vs_1": 2
+  },
+  "scripted": [
+   "heuristic_0.5",
+   "heuristic_1.0",
+   "evasion"
+  ],
+  "p_self": 0.35,
+  "p_scripted": 0.2,
+  "snapshot_every": 250000
+ }
+}

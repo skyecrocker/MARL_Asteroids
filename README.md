@@ -23,6 +23,7 @@ scripts/
   league.py      Round-robin league, Bradley-Terry ratings on the Elo scale
   watch.py       Watch agents, play as a human with difficulty handicaps, record video
 tests/           pytest suite (API compliance, seeding, reward/obs/mechanics regressions)
+models/phaseA/   Phase A checkpoints: self-play final, baseline, and difficulty-ladder snapshots
 models/legacy/   Checkpoints from the original project (need tag v0-legacy to run)
 results/legacy/  Original evaluation CSVs, figures, and analysis notebook
 runs/            TensorBoard logs, training logs (git-ignored)
@@ -48,14 +49,14 @@ uv run python scripts/train.py --preset selfplay --run selfplay_v2 --timesteps 2
 uv run tensorboard --logdir runs/tensorboard
 
 # Evaluate (mirrored: every seed played with the teams swapped)
-uv run python scripts/evaluate.py --blue models/selfplay_v2/best_model.zip \
+uv run python scripts/evaluate.py --blue models/selfplay_v2/final_model.zip \
     --red heuristic_0.25 heuristic_0.5 heuristic_0.75 heuristic_1.0 --games 500 --out results/sp.csv
 uv run python scripts/league.py --agents heuristic_0.5 heuristic_1.0 \
-    models/baseline_v2/best_model.zip models/selfplay_v2/best_model.zip
+    models/baseline_v2/best_model.zip models/selfplay_v2/final_model.zip
 
 # Watch, play, record
-uv run python scripts/watch.py --scenario demo_team2 --blue models/selfplay_v2/best_model.zip
-uv run python scripts/watch.py --scenario demo_duel --blue human --red models/selfplay_v2/best_model.zip \
+uv run python scripts/watch.py --scenario demo_team2 --blue models/selfplay_v2/final_model.zip
+uv run python scripts/watch.py --scenario demo_duel --blue human --red models/selfplay_v2/final_model.zip \
     --difficulty easy
 uv run python scripts/watch.py --scenario demo_team3 --games 3 --record demo.mp4
 ```
@@ -202,6 +203,60 @@ shot decides most duels. Reaction delay is the effective lever today.
   learner).
 - Checkpoints: `models/<run>/best_model.zip` (best mean win rate), `final_model.zip`, `snapshots/`,
   `eval_history.json`. Roughly 3-4k agent-steps/s on 12 cores.
+
+## Results (Phase A: deathmatch with health)
+
+Two agents trained on the current environment (221-d observation, health and shields):
+
+- `baseline_v2`: 8M steps of PPO against scripted bots only (47 min).
+- `selfplay_v2`: 20M steps of league self-play (95 min).
+
+**Against the full-strength heuristic** (200 mirrored games each, `results/*_vs_heuristic.csv`):
+
+| Scenario | baseline_v2 | selfplay_v2 (final) | heuristic vs itself |
+|---|---|---|---|
+| duel | 100% | 93% | 27% win / 47% draw |
+| duel_rocks | 98.5% | 92.5% | 43% |
+| team2 | 98.5% | 96.5% | 46% |
+| team3 | 99.5% | 99% | 47.5% |
+
+**League ratings** (`scripts/league.py`, every pair 100 mirrored games per scenario, Elo scale
+anchored at heuristic_1.0 = 1000, `results/league_phaseA.csv`). Differences under roughly 50 are
+within noise:
+
+| Agent | duel | team2 | team3 | overall |
+|---|---|---|---|---|
+| selfplay_v2 final | 1610 | 1847 | 1812 | **1718** |
+| selfplay_v2 best | 1597 | 1807 | 1763 | 1685 |
+| self-play snapshot @ 10M | 1594 | 1792 | 1778 | 1684 |
+| self-play snapshot @ 5M | 1578 | 1754 | 1691 | 1639 |
+| baseline_v2 | 1435 | 1720 | 1724 | 1588 |
+| self-play snapshot @ 2.5M | 1480 | 1468 | 1415 | 1440 |
+| self-play snapshot @ 1M | 1075 | 944 | 1052 | 1026 |
+| heuristic_1.0 | 1000 | 1000 | 1000 | 1000 |
+| heuristic_0.5 | 917 | 863 | 851 | 880 |
+| self-play snapshot @ 250k | 811 | 819 | 935 | 859 |
+
+What this shows:
+
+- **Self-play is stronger, even though it scores lower against the bot.** baseline_v2 wins more
+  often against the heuristic, but selfplay_v2 beats baseline_v2 head to head (about 70% in duels,
+  65-70% in 2v2). Training only against a fixed bot partly learns to exploit that bot.
+- **`best_model.zip` is the wrong checkpoint for self-play runs.** It is chosen by win rate against
+  the heuristic, which saturates near 100%, and it loses to `final_model.zip` head to head. Use
+  `final_model.zip` (or league ratings) to pick self-play checkpoints.
+- **Self-play plateaued around 10M steps.** The 10M snapshot, best, and final are within noise of
+  each other, so the second 10M steps added little.
+- **The snapshots form a natural difficulty ladder** from below heuristic_0.5 up to the final
+  agent, with a gap between 1M (≈1030) and 2.5M (≈1440).
+- **No measurable teamwork yet.** The shared-kill rate (share of kills where 2+ teammates damaged
+  the victim) is 0.44-0.46 in 2v2 and 0.56-0.58 in 3v3 for selfplay_v2, against 0.43/0.53 for
+  baseline_v2 and 0.44/0.44 for the heuristic, which never coordinates. The agents win on
+  individual skill. This matches the design argument that deathmatch does not force cooperation.
+
+Checkpoints are in `models/phaseA/` (see its README); full run directories are git-ignored.
+Clips in `results/clips/`. Note that static demo arenas with deterministic policies replay the
+identical game every time.
 
 ## Changes from the original project
 

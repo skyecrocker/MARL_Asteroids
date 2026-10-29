@@ -1,6 +1,7 @@
 """Round-robin league with Bradley-Terry (Elo-scale) ratings.
 
-Every pair of agents plays ``--games`` games per scenario (half with each color). Ratings are fit
+Every pair of agents plays ``--games`` games per scenario, mirrored (each seed played with the
+colors swapped) whenever team sizes are equal. Ratings are fit
 by maximum likelihood on win=1 / draw=0.5 / loss=0 scores and reported on the Elo scale, anchored so
 that ``--anchor`` (default heuristic_1.0) = 1000.
 
@@ -21,8 +22,13 @@ import numpy as np
 import torch as th
 
 from marl_asteroids.config import get_scenario
-from marl_asteroids.matches import play_matches
+from marl_asteroids.matches import play_matches, play_matches_mirrored
 from marl_asteroids.policies import resolve_policy
+
+
+def label(name: str) -> str:
+    """Short unambiguous name: scripted names as-is, checkpoints as '<run>/<file>'."""
+    return "/".join(name.split("/")[-2:]) if name.endswith(".zip") else name
 
 
 def fit_bradley_terry(n: int, results, iters: int = 2000, lr: float = 0.5, prior: float = 1e-3):
@@ -55,13 +61,14 @@ def main():
     for sc in args.scenarios:
         cfg = get_scenario(sc)
         for i, j in itertools.combinations(range(len(names)), 2):
-            half = args.games // 2
-            a = play_matches(cfg, pols[i], pols[j], half, seed=args.seed)          # i is blue
-            b = play_matches(cfg, pols[j], pols[i], half, seed=args.seed + 10**6)  # i is red
-            score_i = (a.blue_score * a.games + (1 - b.blue_score) * b.games) / (a.games + b.games)
-            per_scenario[sc].append((i, j, score_i, a.games + b.games))
-            print(f"{sc:8s} {os.path.basename(names[i])[:24]:24s} vs {os.path.basename(names[j])[:24]:24s} "
-                  f"score {score_i:.3f}", flush=True)
+            if cfg.n_red == cfg.m_blue:
+                # Same seeds with colors swapped, so spawn advantage cancels exactly
+                stats = play_matches_mirrored(cfg, pols[i], pols[j], args.games, seed=args.seed)
+            else:
+                stats = play_matches(cfg, pols[i], pols[j], args.games, seed=args.seed)
+            per_scenario[sc].append((i, j, stats.blue_score, stats.games))
+            print(f"{sc:8s} {label(names[i])[:30]:30s} vs {label(names[j])[:30]:30s} "
+                  f"score {stats.blue_score:.3f}", flush=True)
 
     elo = 400 / np.log(10)
     anchor = names.index(args.anchor) if args.anchor in names else 0
@@ -75,7 +82,7 @@ def main():
     order = np.argsort(-table["overall"])
     rows = []
     for k in order:
-        row = ["/".join(names[k].split("/")[-2:]) if names[k].endswith(".zip") else names[k]]
+        row = [label(names[k])]
         vals = [f"{table[sc][k]:.0f}" for sc in table]
         print(f"{row[0][-32:]:>32s}  " + "  ".join(f"{v:>10s}" for v in vals))
         rows.append(dict(zip(header, row + vals)))

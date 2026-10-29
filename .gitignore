@@ -10,6 +10,7 @@ __pycache__/
 runs/
 models/*
 !models/legacy/
+!models/phaseA/
 
 # Local / unrelated files
 _unrelated/

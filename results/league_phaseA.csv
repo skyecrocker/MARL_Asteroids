@@ -1,0 +1,11 @@
+agent,duel,team2,team3,overall
+selfplay_v2/final_model.zip,1610,1847,1812,1718
+selfplay_v2/best_model.zip,1597,1807,1763,1685
+snapshots/snap_10003k.zip,1594,1792,1778,1684
+snapshots/snap_5001k.zip,1578,1754,1691,1639
+baseline_v2/best_model.zip,1435,1720,1724,1588
+snapshots/snap_2500k.zip,1480,1468,1415,1440
+snapshots/snap_1000k.zip,1075,944,1052,1026
+heuristic_1.0,1000,1000,1000,1000
+heuristic_0.5,917,863,851,880
+snapshots/snap_250k.zip,811,819,935,859

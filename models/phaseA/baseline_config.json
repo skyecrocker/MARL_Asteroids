@@ -1,0 +1,38 @@
+{
+ "args": {
+  "preset": "baseline",
+  "run": "baseline_v2",
+  "timesteps": 8000000.0,
+  "init": null,
+  "seed": 0,
+  "eval_every": 1000000.0,
+  "eval_games": 100,
+  "n_steps": 256,
+  "lr": 0.0003,
+  "ent_coef": 0.01,
+  "gamma": 0.995,
+  "team_spirit": null,
+  "shaping_scale": null,
+  "threads": 4,
+  "workers": 11,
+  "games_mult": 3
+ },
+ "preset": {
+  "mix": {
+   "duel": 6,
+   "duel_rocks": 6,
+   "team2": 6,
+   "team3": 4
+  },
+  "scripted": [
+   "heuristic_0.25",
+   "heuristic_0.5",
+   "heuristic_0.75",
+   "heuristic_1.0",
+   "evasion"
+  ],
+  "p_self": 0.0,
+  "p_scripted": 1.0,
+  "snapshot_every": 0
+ }
+}

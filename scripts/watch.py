@@ -8,6 +8,7 @@ Examples:
 """
 from __future__ import annotations
 import argparse
+import time
 
 import numpy as np
 import pygame
@@ -142,15 +143,24 @@ def main():
                 break
             result = {1: "BLUE wins", 0: "RED wins", -1: "draw"}.get(env.winner, "?")
             print(f"Game {game + 1}: {result} after {env.frame} frames")
-            if not args.record:  # hold the end-of-game screen briefly
-                for _ in range(int(args.fps * 1.2)):
+            if args.record:  # hold the result banner for ~1s in the clip
+                final = env.render()
+                frames.extend([final] * max(1, round(args.fps / cfg.action_repeat)))
+            else:  # hold the end-of-game screen for ~1.2s of wall time, independent of --fps
+                hold_until = time.monotonic() + 1.2
+                while time.monotonic() < hold_until:
                     env.render()
     finally:
         env.close()
     if args.record and frames:
         import imageio.v2 as imageio
-        imageio.mimsave(args.record, frames[::2], fps=max(1, args.fps // 2))
-        print(f"Saved {args.record} ({len(frames[::2])} frames)")
+        # One frame is captured per env.step, which covers ``action_repeat`` physics frames, so
+        # real-time playback is fps / action_repeat. (Previously this also dropped every other
+        # frame at fps/2, which played clips back at 2x speed.)
+        out_fps = max(1, round(args.fps / cfg.action_repeat))
+        imageio.mimsave(args.record, frames, fps=out_fps)
+        print(f"Saved {args.record} ({len(frames)} frames at {out_fps} fps, "
+              f"{len(frames) / out_fps:.1f}s)")
 
 
 if __name__ == "__main__":
