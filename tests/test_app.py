@@ -112,8 +112,8 @@ def test_defaults_put_you_in_blue_1_in_a_deathmatch(app):
 
 def test_main_menu_has_no_watch_button(app):
     run(app, 1)
-    texts = {el.text for el in app.screen._buttons}
-    assert texts == {"Play", "Gallery", "Settings", "Quit"}
+    texts = [el.text for el in app.screen._buttons]
+    assert texts == ["Roguelite survival", "Classic survival", "Experimental", "Settings", "Quit"]
 
 
 def test_switching_to_an_objective_mode_swaps_trained_agents_for_bots(app):
@@ -226,9 +226,13 @@ def test_full_flow_through_every_screen(app):
     press(app, "Settings"); run(app, 2)
     assert isinstance(app.screen, S.SettingsScreen)
     press(app, "Back"); run(app, 2)
+    press(app, "Experimental"); run(app, 2)
+    assert isinstance(app.screen, S.ExperimentalMenuScreen)
     press(app, "Gallery"); run(app, 2)
     assert isinstance(app.screen, S.GalleryScreen)
     press(app, "Back"); run(app, 2)
+    press(app, "Back"); run(app, 2)
+    assert isinstance(app.screen, S.MainMenuScreen)
 
     setup = quick_watch(app)
     press(app, "Start")
@@ -382,3 +386,128 @@ def test_survival_enemies_share_one_controller(app):
     assert {c for a, c in setup.spec.controllers.items() if a.startswith("red")} == {"heuristic_0.5"}
     setup._set_mode("deathmatch")  # back to a normal 2-ship red team
     assert len([a for a in setup.spec.controllers if a.startswith("red")]) == 2
+
+
+# ----------------------------------------------------------------------------- roguelite
+
+
+def bot_run(seed=3, **cfg_changes):
+    """A run whose player is a scripted bot (no keyboard in tests), tough enough to clear wave 1."""
+    import dataclasses
+
+    from marl_asteroids.policies import make_scripted
+    from marl_asteroids.roguelite import DEFAULT_ROGUELITE, RogueliteRun
+    cfg = dataclasses.replace(DEFAULT_ROGUELITE,
+                              player_base=DEFAULT_ROGUELITE.player_base.replace(max_hull=80),
+                              **cfg_changes)
+    return RogueliteRun(cfg, player_policy=make_scripted("heuristic_1.0", seed=1), seed=seed)
+
+
+def start_run(app, r):
+    app.push(S.RogueliteGameScreen(app, r))
+    return app.screen
+
+
+def test_classic_survival_preselects_survival(app):
+    run(app, 1)
+    press(app, "Classic survival")
+    assert isinstance(app.screen, S.SetupScreen) and app.screen.spec.mode == "survival"
+    assert "Enemies" in texts_on(app.screen)
+
+
+def test_experimental_menu_entries_and_back(app):
+    run(app, 1)
+    press(app, "Experimental")
+    menu = app.screen
+    assert [el.text for el in menu._buttons] == ["Custom match", "Gallery", "Back"]
+    press(app, "Custom match")
+    assert isinstance(app.screen, S.SetupScreen)
+    assert {m for _, m in S.MODE_OPTIONS} == set(S.MODES)
+    press(app, "Back")
+    assert app.screen is menu
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
+    run(app, 1)
+    assert isinstance(app.screen, S.MainMenuScreen)
+
+
+def test_roguelite_button_starts_a_run(app):
+    run(app, 1)
+    press(app, "Roguelite survival")
+    game = app.screen
+    assert isinstance(game, S.RogueliteGameScreen) and game.run.phase == "wave"
+    assert game.env.mode == "roguelite" and game.env.width == 2400
+    run(app, 3)
+    game.pause()
+    assert [el.text for el in game._buttons] == ["Resume", "Quit run"]
+    press(app, "Quit run")
+    assert isinstance(app.screen, S.MainMenuScreen) and len(app.stack) == 1 and game.env is None
+
+
+def test_roguelite_shop_flow(app):
+    import types
+    app.clock = types.SimpleNamespace(tick=lambda fps=0: 16)  # don't pace a whole wave at 60 fps
+    r = bot_run(arena="small", num_asteroids=0)
+    game = start_run(app, r)
+    env = game.env
+    run_until(app, S.ShopScreen)
+    shop = app.screen
+    assert r.phase == "shop" and r.state.waves_cleared == 1
+    texts = texts_on(shop)
+    assert {"Your Ship", "Wingmen", "Continue"} <= set(texts) | {el.text for el in shop._buttons}
+    assert any(t.startswith("Wave 1 cleared") for t in texts)
+    # No wingmen yet: their upgrades are locked
+    for item in ("wing.tier", "wing.hull", "wing.shield", "wing.fire_rate", "wing.engine"):
+        assert not shop.buy_buttons[item].is_enabled
+    r.state.credits = 1000
+    shop.rebuild()
+    before = r.state.credits
+    cost = shop.rows["wing.buy"].cost
+    press_buy = shop.buy_buttons["wing.buy"]
+    shop._buttons[press_buy]()  # same as clicking Buy
+    assert r.state.credits == before - cost and r.state.wingmen == 1
+    assert shop.rows["wing.buy"].level_text == "1/3 owned" and shop.buy_buttons["wing.hull"].is_enabled
+    assert any(t.startswith(f"{r.state.credits} credits") for t in texts_on(shop))
+    # Esc doesn't skip the shop
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
+    run(app, 1)
+    assert app.screen is shop
+    press(app, "Continue")
+    assert app.screen is game and game.env is env and r.phase == "wave" and r.state.wave == 2
+    run(app, 5)
+    assert env.ships["blue_1"].active and env.frame > 0
+
+
+def test_roguelite_run_over_screen(app):
+    r = bot_run()
+    game = start_run(app, r)
+    run(app, 2)
+    player = game.env.ships["blue_0"]
+    player.protection = 0
+    player.apply_damage(1000)
+    run_until(app, S.RunOverScreen)
+    over = app.screen
+    assert over.summary["wave"] == 1 and "Run over" in texts_on(over)
+    assert game.env is None  # the run's env was closed
+    press(app, "New run")
+    fresh = app.screen
+    assert isinstance(fresh, S.RogueliteGameScreen) and fresh.run is not r
+    assert fresh.run.state.wave == 1 and fresh.run.state.wingmen == 0
+    fresh.pause()
+    press(app, "Quit run")
+    assert isinstance(app.screen, S.MainMenuScreen)
+
+
+def test_roguelite_legend_toggle(app):
+    game = start_run(app, bot_run())
+    assert game.show_legend
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_l))
+    run(app, 1)
+    assert not game.show_legend
+
+
+def test_broken_roguelite_tables_report_on_the_menu(app, monkeypatch):
+    run(app, 1)
+    menu = app.screen
+    monkeypatch.setattr(S, "RogueliteRun", lambda: (_ for _ in ()).throw(ValueError("bad table")))
+    press(app, "Roguelite survival")
+    assert app.screen is menu and "bad table" in menu.error

@@ -1,7 +1,9 @@
-"""App screens: main menu, match setup, game (+ pause), results, settings, gallery."""
+"""App screens: main menu, experimental menu, match setup, game (+ pause), results, roguelite run
+(game, shop, run over), settings, gallery."""
 from __future__ import annotations
 
 import copy
+import math
 import os
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -12,8 +14,9 @@ from pygame_gui.elements import (UIButton, UIDropDownMenu, UIHorizontalSlider, U
 
 from ..checkpoints import discover
 from ..config import ARENA_SIZES, MAX_TEAM_SIZE, MODE_NAMES, MODE_TIME_LIMIT, MODES
-from ..render import TEAM_COLORS, Renderer
-from ..env import BLUE, RED
+from ..render import TEAM_COLORS, Renderer, draw_legend, draw_look, legend_height, ship_look
+from ..env import BLUE, PLAYER, RED
+from ..roguelite import RogueliteRun, shop_rows, wingman_tier
 from ..session import DIFFICULTY, HUMAN, KEEP, PHYSICS_FPS, MatchSpec, agent_names, build_config, build_match
 from .main import BG, Screen
 from .settings import WINDOW_SIZES
@@ -205,20 +208,57 @@ class MainMenuScreen(MenuScreen):
         self.label((0, y - 6, w, 84), "MARL ASTEROIDS", "#title")
         self.label((0, y + 74, w, 30), "Multi-agent reinforcement learning, in space", "#subtitle")
         y += 140
-        self.card((x - 30, y - 20, col + 60, 4 * 62 + 30))
-        for text, cb in (("Play", lambda: self.app.push(SetupScreen(self.app))),
-                         ("Gallery", lambda: self.app.push(GalleryScreen(self.app))),
-                         ("Settings", lambda: self.app.push(SettingsScreen(self.app))),
-                         ("Quit", self.app.quit)):
+        entries = (("Roguelite survival", self.new_run),
+                   ("Classic survival", lambda: self.app.push(SetupScreen(self.app, mode="survival"))),
+                   ("Experimental", lambda: self.app.push(ExperimentalMenuScreen(self.app))),
+                   ("Settings", lambda: self.app.push(SettingsScreen(self.app))),
+                   ("Quit", self.app.quit))
+        self.card((x - 30, y - 20, col + 60, len(entries) * 62 + 30))
+        for text, cb in entries:
             self.button((x, y, col, 50), text, cb, "#menu_button")
             y += 62
-        n = len(models(refresh=True))
-        note = (f"{n} trained agents available" if n else
-                "No compatible trained agents found in models/ (bots only)")
-        self.label((0, h - 40, w, 24), note, "#note")
+        self.error = getattr(self, "error", "")
+        if self.error:
+            note = self.error
+        else:
+            n = len(models(refresh=True))
+            note = (f"{n} trained agents available" if n else
+                    "No compatible trained agents found in models/ (bots only)")
+        self.label((0, h - 40, w, 24), note, "#error" if self.error else "#note")
+
+    def new_run(self):
+        try:
+            run = RogueliteRun()
+        except Exception as e:  # broken tuning tables: report, don't crash
+            self.error = f"Can't start a run: {e}"
+            self.rebuild()
+            return
+        self.error = ""
+        self.app.push(RogueliteGameScreen(self.app, run))
 
     def back(self):
         self.app.quit()
+
+
+class ExperimentalMenuScreen(MenuScreen):
+    """Every other mode (through the full match setup) and the MARL gallery."""
+
+    def build(self):
+        w, h = self.app.size
+        col = 320
+        x = self.center_x(col)
+        y = int(h * 0.2)
+        self.label((0, y - 6, w, 60), "Experimental", "#heading_center")
+        self.label((0, y + 50, w, 30), "Every mode, any teams and AI, plus the MARL gallery. "
+                                       "Less polished than the survival modes.", "#subtitle")
+        y += 120
+        entries = (("Custom match", lambda: self.app.push(SetupScreen(self.app))),
+                   ("Gallery", lambda: self.app.push(GalleryScreen(self.app))),
+                   ("Back", self.back))
+        self.card((x - 30, y - 20, col + 60, len(entries) * 62 + 30))
+        for text, cb in entries:
+            self.button((x, y, col, 50), text, cb, "#menu_button")
+            y += 62
 
 
 # ------------------------------------------------------------------------- match setup
@@ -259,7 +299,7 @@ def sanitize(spec: MatchSpec) -> MatchSpec:
 class SetupScreen(MenuScreen):
     ROW = 44
 
-    def __init__(self, app):
+    def __init__(self, app, mode: Optional[str] = None):
         super().__init__(app)
         models(refresh=True)  # pick up checkpoints trained since the app started
         saved = app.settings.last_setup
@@ -268,6 +308,8 @@ class SetupScreen(MenuScreen):
         self.status = ""
         self.status_is_error = False
         self._pending_start = 0
+        if mode is not None and mode != self.spec.mode:
+            self._apply_mode(mode)  # e.g. "Classic survival" on the main menu
 
     # spec helpers --------------------------------------------------------------
     def _cfg(self):
@@ -305,6 +347,11 @@ class SetupScreen(MenuScreen):
             self._refresh_preview()
 
     def _set_mode(self, mode):
+        self._apply_mode(mode)
+        self.rebuild()
+
+    def _apply_mode(self, mode):
+        """Switch modes without touching widgets (usable before the screen is shown)."""
         self.spec.mode = mode
         self.spec.time_limit = KEEP  # each mode has its own sensible default clock
         self.status, self.status_is_error = "", False
@@ -320,7 +367,6 @@ class SetupScreen(MenuScreen):
                 self.status = ("Trained agents only know combat modes, so AI ships now use "
                                "bots. You can still pick them.")
         self._sync_controllers()  # survival brings its enemy pool; other modes trim back
-        self.rebuild()
 
     def _set_arena(self, arena):
         self.spec.num_asteroids = None  # new arena, its own default rock count
@@ -877,6 +923,281 @@ class ResultsScreen(MenuScreen):
     def handle_event(self, event):
         if event.type == pygame.KEYDOWN and event.key in (pygame.K_RETURN, pygame.K_SPACE):
             self.again()
+            return
+        super().handle_event(event)
+
+
+# ---------------------------------------------------------------------------- roguelite
+
+ROGUELITE_VIEW = 1000.0  # world units across the screen: a bit closer than matches, ships read better
+CLEARED_HOLD_SECONDS = 1.2
+
+
+def draw_pips(surface, ship, x, y, active=True):
+    """Hull and shield pips in a row (the roster style)."""
+    for i in range(ship.max_hp):
+        if i < ship.max_hull:
+            on = i < ship.hull
+            c = ((120, 230, 140) if ship.hull > 1 else (255, 120, 110)) if on else (56, 40, 44)
+        else:
+            c = (110, 220, 255) if (i - ship.max_hull) < ship.shield else (34, 48, 62)
+        pygame.draw.rect(surface, c if active else (40, 42, 50), (x, y, 12, 6))
+        x += 15
+
+
+class RogueliteGameScreen(GameScreen):
+    """A roguelite run: waves with a shop in between. Pushes the shop when a wave is cleared and
+    resumes the same env when it pops; replaces itself with the run-over screen at the end."""
+
+    def __init__(self, app, run: RogueliteRun):
+        super().__init__(app, run)
+        self.run = run
+        self.show_legend = True
+        self.shop_hold: Optional[int] = None
+
+    def _start_game(self):
+        w, h = self.app.size
+        s = self.app.settings
+        self.side = min(w, h)
+        self.env = self.run.make_env()
+        self.renderer = Renderer(self.env, window=self.side, follow=PLAYER, view_size=ROGUELITE_VIEW,
+                                 effects=s.effects, minimap=s.minimap, show_obs=s.show_obs,
+                                 hud_text=self.run.hud_text)
+        self.env.on_frame = self._on_frame
+        self.run.start()
+        self.paused = False
+        self.end_hold = None
+        self.shop_hold = None
+        self.font = pygame.font.SysFont("dejavusansmono,consolas,monospace", 15)
+        self.font_big = pygame.font.SysFont("dejavusansmono,consolas,monospace", 20, bold=True)
+
+    def build(self):  # pause card
+        if not self.paused:
+            return
+        w, h = self.app.size
+        cw = 300
+        x = self.center_x(cw)
+        y = h // 2 - 90
+        self.card((x - 30, y - 60, cw + 60, 210))
+        self.label((x, y - 48, cw, 40), "Paused", "#heading")
+        for text, cb in (("Resume", self.resume), ("Quit run", self.app.home)):
+            self.button((x, y, cw, 46), text, cb, "#menu_button")
+            y += 58
+
+    def handle_event(self, event):
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_l:
+            self.show_legend = not self.show_legend
+            return
+        super().handle_event(event)
+
+    def advance(self):
+        if self.end_hold is not None:  # run over: keep effects running under the banner
+            self.app.present(self._draw)
+            self.end_hold -= 1
+            if self.end_hold <= 0:
+                self._finish()
+            return
+        if self.shop_hold is not None:  # "wave cleared" for a moment, then the shop
+            self.app.present(self._draw)
+            self.shop_hold -= 1
+            if self.shop_hold <= 0:
+                self.shop_hold = None
+                self.app.push(ShopScreen(self.app, self.run))
+            return
+        if self.run.phase != "wave":
+            return
+        if self.env.frame == 0 and self.frame_surface is None:
+            self.app.present(self._draw)
+        phase = self.run.step()  # draws and paces through env.on_frame
+        if phase == "over":
+            self.end_hold = int(self.END_HOLD_SECONDS * PHYSICS_FPS)
+        elif phase == "shop":
+            self.shop_hold = int(CLEARED_HOLD_SECONDS * PHYSICS_FPS)
+
+    def _finish(self):
+        self.app.replace(RunOverScreen(self.app, self.run.summary(), self.run.cfg))
+
+    def _compose(self, surface, frame):
+        w, h = surface.get_size()
+        surface.fill(BG)
+        ox, oy = (w - frame.get_width()) // 2, (h - frame.get_height()) // 2
+        surface.blit(frame, (ox, oy))
+        margin = ox
+        if margin >= 170:
+            self._draw_fleet(surface, pygame.Rect(16, 20, margin - 32, h - 40))
+            self._draw_wave_panel(surface, pygame.Rect(ox + frame.get_width() + 16, 20,
+                                                       margin - 32, h - 40))
+        elif self.show_legend:  # no side margins: overlay the key on the play area
+            r = pygame.Rect(ox + 12, oy + 50, 230, legend_height(22) + 16)
+            panel = pygame.Surface(r.size, pygame.SRCALPHA)
+            panel.fill((8, 10, 20, 170))
+            surface.blit(panel, r.topleft)
+            draw_legend(surface, (r.x + 8, r.y + 8, r.width - 16), self.font, row=22, hints=False)
+
+    def _draw_fleet(self, surface, rect):
+        env, state = self.env, self.run.state
+        col = TEAM_COLORS[BLUE]["hull"]
+        surface.blit(self.font_big.render("YOUR FLEET", True, col), (rect.x, rect.y))
+        y = rect.y + 34
+        tier = wingman_tier(self.run.cfg, state).label
+        for agent in env.team_agents[BLUE]:
+            ship = env.ships[agent]
+            if ship.reserve:
+                continue
+            look = ship_look(ship)
+            draw_look(surface, look, (rect.x + 10, y + 10), -math.pi / 2, 7.0, edge_width=1)
+            name = "You" if agent == PLAYER else f"Wingman {agent.split('_')[1]}"
+            sub = "" if agent == PLAYER else f"{tier} AI"
+            if not ship.active:
+                sub = "down: back next wave"
+            surface.blit(self.font.render(name, True, col if ship.active else (90, 96, 112)),
+                         (rect.x + 28, y + 2))
+            if sub:
+                surface.blit(self.font.render(sub, True, (150, 160, 182)), (rect.x + 28, y + 20))
+            draw_pips(surface, ship, rect.x + 28, y + 40, ship.active)
+            y += 62
+        hints = ["W / Up     thrust", "A D / arrows turn", "Space      shoot", "L  legend",
+                 "Esc  pause"]
+        for i, line in enumerate(reversed(hints)):
+            surface.blit(self.font.render(line, True, (110, 120, 145)),
+                         (rect.x, rect.bottom - 20 - i * 20))
+
+    def _draw_wave_panel(self, surface, rect):
+        state = self.run.state
+        col = TEAM_COLORS[RED]["hull"]
+        surface.blit(self.font_big.render(f"WAVE {state.wave}", True, col), (rect.x, rect.y))
+        y = rect.y + 34
+        left = self.run.enemies_left()
+        for text, c in ((f"{left} enem{'y' if left == 1 else 'ies'} left", col),
+                        (f"{state.credits} credits", (255, 210, 122)),
+                        (f"{state.waves_cleared} cleared", (150, 160, 182))):
+            surface.blit(self.font.render(text, True, c), (rect.x, y))
+            y += 22
+        if self.show_legend:
+            draw_legend(surface, (rect.x, y + 16, rect.width), self.font, row=24)
+        else:
+            surface.blit(self.font.render("L  show legend", True, (110, 120, 145)), (rect.x, y + 16))
+
+
+class ShopScreen(MenuScreen):
+    """Between waves: spend credits on your ship and your wingmen, then Continue."""
+
+    ROW = 52
+
+    def __init__(self, app, run: RogueliteRun):
+        super().__init__(app)
+        self.run = run
+        self.font = None
+
+    def build(self):
+        w, h = self.app.size
+        state = self.run.state
+        pad, gap = 40, 24
+        legend_w = 330 if w >= 1400 else 240  # wide enough for row descriptions on big windows
+        col_w = (w - 2 * pad - 2 * gap - legend_w) // 2
+        top = 110
+        self.label((pad, 24, w - 2 * pad, 44), f"Wave {state.wave} cleared", "#heading")
+        self.credits_label = self.label((pad, 64, w - 2 * pad, 30),
+                                        f"{state.credits} credits  ·  {self.run.state.waves_cleared} "
+                                        f"wave{'s' if state.waves_cleared != 1 else ''} cleared",
+                                        "#cost_left")
+        rows = shop_rows(state, self.run.cfg)
+        self.rows = {r.id: r for r in rows}
+        self.buy_buttons = {}
+        card_h = h - top - 120
+        for c, (column, title) in enumerate((("player", "Your Ship"), ("wingmen", "Wingmen"))):
+            x = pad + c * (col_w + gap)
+            self.card((x, top, col_w, card_h))
+            self.label((x + 20, top + 14, col_w - 40, 30), title, "#heading")
+            y = top + 58
+            name_w = col_w - 40 - 110 - 80 - 84
+            for r in (r for r in rows if r.column == column):
+                self.label((x + 20, y, name_w, 24), r.name)
+                self.label((x + 20, y + 22, name_w + 110, 20), r.blurb, "#hint")
+                self.label((x + 20 + name_w, y, 110, 24), r.level_text, "#stat")
+                self.label((x + 20 + name_w + 110, y, 80, 24),
+                           "Maxed" if r.maxed else f"{r.cost} cr", "#cost")
+                b = self.button((x + col_w - 20 - 76, y, 76, 36), "Buy",
+                                lambda i=r.id: self.purchase(i))
+                if not r.enabled:
+                    b.disable()
+                self.buy_buttons[r.id] = b
+                y += self.ROW
+            if column == "wingmen" and state.wingmen == 0:
+                self.label((x + 20, y + 6, col_w - 40, 22), "Buy a wingman to unlock their upgrades.",
+                           "#hint")
+        self.legend_rect = pygame.Rect(w - pad - legend_w, top, legend_w, card_h)
+        self.card(self.legend_rect)
+        self.button((w // 2 - 110, h - 90, 220, 50), "Continue", self.continue_run,
+                    "#primary_button")
+        self.label((w // 2 + 130, h - 80, 220, 30), "Enter  continue", "#hint")
+        self.button((pad, h - 90, 160, 50), "Quit run", self.app.home)
+
+    def purchase(self, item_id: str):
+        if not self.rows[item_id].enabled:
+            return
+        self.run.buy(item_id)
+        self.rebuild()  # credits, levels, costs and every Buy button update together
+
+    def continue_run(self):
+        self.run.next_wave()
+        self.app.pop()
+
+    def back(self):
+        pass  # Esc must not skip the shop without starting the next wave
+
+    def handle_event(self, event):
+        if event.type == pygame.KEYDOWN and event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.continue_run()
+            return
+        super().handle_event(event)
+
+    def draw(self, surface):
+        super().draw(surface)
+        if self.font is None:
+            self.font = pygame.font.SysFont("dejavusansmono,consolas,monospace", 15)
+        r = self.legend_rect
+        draw_legend(surface, (r.x + 18, r.y + 16, r.width - 36), self.font, row=28)
+
+
+class RunOverScreen(MenuScreen):
+    def __init__(self, app, summary: dict, cfg):
+        super().__init__(app)
+        self.summary = summary
+        self.cfg = cfg
+
+    def build(self):
+        w, h = self.app.size
+        cw = 520
+        x = self.center_x(cw)
+        y = int(h * 0.18)
+        s = self.summary
+        rows = [("Wave reached", s.get("wave", 1)), ("Waves cleared", s.get("waves_cleared", 0)),
+                ("Kills by you", s.get("player_kills", 0)),
+                ("Kills by the fleet", s.get("fleet_kills", 0)),
+                ("Wingmen", s.get("wingmen", 0)),
+                ("Credits earned", s.get("credits_earned", 0))]
+        self.card((x - 30, y - 20, cw + 60, 140 + 32 * len(rows) + 90))
+        self.label((x, y - 6, cw, 80), "Run over", "#title")
+        self.label((x, y + 70, cw, 28), f"Destroyed during wave {s.get('wave', 1)}", "#subtitle")
+        ty = y + 120
+        for name, value in rows:
+            self.label((x + 80, ty, 240, 26), name, "#stat_name")
+            self.label((x + 320, ty, 120, 26), str(value), "#stat")
+            ty += 32
+        bw = (cw - 10) // 2
+        self.button((x, ty + 24, bw, 46), "New run", self.new_run, "#primary_button")
+        self.button((x + bw + 10, ty + 24, bw, 46), "Main menu", self.app.home)
+
+    def new_run(self):
+        self.app.replace(RogueliteGameScreen(self.app, RogueliteRun(self.cfg)))
+
+    def back(self):
+        self.app.home()
+
+    def handle_event(self, event):
+        if event.type == pygame.KEYDOWN and event.key in (pygame.K_RETURN, pygame.K_SPACE):
+            self.new_run()
             return
         super().handle_event(event)
 

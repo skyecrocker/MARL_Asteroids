@@ -74,6 +74,37 @@
       "normal_text": "#8a98b8"
     }
   },
+  "#heading_center": {
+    "font": {
+      "name": "noto_sans",
+      "size": "36",
+      "bold": "1"
+    },
+    "colours": {
+      "normal_text": "#a9d4ff"
+    }
+  },
+  "#cost_left": {
+    "font": {
+      "name": "noto_sans",
+      "size": "18",
+      "bold": "1"
+    },
+    "colours": {
+      "normal_text": "#ffd27a"
+    },
+    "misc": {
+      "text_horiz_alignment": "left"
+    }
+  },
+  "#cost": {
+    "colours": {
+      "normal_text": "#ffd27a"
+    },
+    "misc": {
+      "text_horiz_alignment": "right"
+    }
+  },
   "#heading": {
     "font": {
       "name": "noto_sans",
