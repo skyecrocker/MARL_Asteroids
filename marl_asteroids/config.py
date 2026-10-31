@@ -370,6 +370,11 @@ MAX_TEAM_SIZE = 8          # ships per team the app offers
 SURVIVAL_MAX_ENEMIES = 20  # enemy pool in survival: waves grow by one each until this many at once
 # Modes where destroyed ships come back. In these the env keeps every agent until the game ends.
 RESPAWN_MODES = ("deathmatch", "siege", "survival", "ctf", "escort")
+# Roguelite survival is driven from outside the env (marl_asteroids/roguelite.py: waves start when
+# the shop closes), so it is not one of the app's setup MODES and make_game() rejects it. The env
+# accepts it through ENV_MODES.
+ROGUELITE_MODE = "roguelite"
+ENV_MODES = tuple(MODES) + (ROGUELITE_MODE,)
 
 ARENA_SIZES: Dict[str, float] = {"mini": 600.0, "small": 1200.0, "medium": 2400.0, "large": 4800.0}
 # Roughly constant density up to medium, sparser on large so it doesn't become an asteroid field

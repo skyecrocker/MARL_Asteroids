@@ -1,9 +1,49 @@
 """Physical entities. All parameters come from the GameConfig instance, not class defaults."""
 from __future__ import annotations
 
+import dataclasses
+from dataclasses import dataclass
+from typing import Dict, Optional
+
 import numpy as np
 
 from .config import GameConfig
+
+
+@dataclass(frozen=True)
+class ShipStats:
+    """Per-ship performance numbers. Every ship carries one; by default it is built from the
+    GameConfig, so existing modes behave exactly as when these were global. Roguelite upgrades and
+    enemy variants override them. Kept as plain numbers so a later training phase can feed them
+    to the policy as observation features."""
+    max_hull: int
+    max_shield: int
+    fire_rate: int          # frames between shots
+    thrust_power: float
+    max_speed: float
+    bullet_lifespan: int    # frames; bullet range is about bullet_speed * bullet_lifespan
+
+    @classmethod
+    def from_config(cls, config: GameConfig, fire_rate: Optional[int] = None) -> "ShipStats":
+        return cls(max_hull=int(config.max_hull), max_shield=int(config.max_shield),
+                   fire_rate=int(fire_rate if fire_rate is not None else config.fire_rate),
+                   thrust_power=float(config.thrust_power), max_speed=float(config.max_speed),
+                   bullet_lifespan=int(config.bullet_lifespan))
+
+    def as_dict(self) -> Dict[str, float]:
+        return {k: (int(v) if isinstance(v, int) else float(v))
+                for k, v in dataclasses.asdict(self).items()}
+
+    def replace(self, **changes) -> "ShipStats":
+        return dataclasses.replace(self, **changes)
+
+
+@dataclass(frozen=True)
+class Loadout:
+    """What a roguelite wave puts in a ship slot: its stats plus cosmetic/payout labels."""
+    stats: ShipStats
+    variant: Optional[str] = None   # "standard" | "scout" | "heavy" | "sniper" | "wingman"
+    tier: Optional[str] = None      # "basic" | "veteran" | "elite"
 
 
 class Entity:
@@ -15,19 +55,18 @@ class Entity:
 
 
 class Ship(Entity):
-    def __init__(self, x, y, team_id: int, agent_name: str, config: GameConfig, fire_rate=None):
+    def __init__(self, x, y, team_id: int, agent_name: str, config: GameConfig, fire_rate=None,
+                 stats: Optional[ShipStats] = None):
         super().__init__(x, y, 0.0, 0.0, config.ship_radius)
         self.team_id = team_id  # 0 red, 1 blue
         self.agent_name = agent_name
         self.angle = 0.0  # Radians
-        self.fire_rate = int(fire_rate if fire_rate is not None else config.fire_rate)
         self.cooldown = 0
         self.thrusting = False  # Last commanded thrust; used only for rendering the flame
+        self.variant: Optional[str] = None  # roguelite look / payout labels (None elsewhere)
+        self.tier: Optional[str] = None
 
-        self.max_hull = int(config.max_hull)
-        self.max_shield = int(config.max_shield)
-        self.hull = self.max_hull
-        self.shield = self.max_shield
+        self.apply_stats(stats or ShipStats.from_config(config, fire_rate), refill=True)
         self.frames_since_damage = 10 ** 9  # Large so a fresh ship is never mid-regen
         self._regen_progress = 0
         self.collision_cooldown = 0  # Gates repeat collision damage while bodies overlap
@@ -36,6 +75,27 @@ class Ship(Entity):
         self.respawn_timer = None    # Frames until this (destroyed) ship returns; None = not coming back
         self.protection = 0          # Frames of invulnerability left after spawning
         self.reserve = False         # Survival: not part of the current wave (neither alive nor dead)
+
+    def apply_stats(self, stats: ShipStats, refill: bool = False):
+        """Set this ship's performance numbers. ``refill`` restores full hull and shield;
+        otherwise current values are clamped to the new maxima."""
+        self.max_hull = int(stats.max_hull)
+        self.max_shield = int(stats.max_shield)
+        self.fire_rate = int(stats.fire_rate)
+        self.thrust_power = float(stats.thrust_power)
+        self.max_speed = float(stats.max_speed)
+        self.bullet_lifespan = int(stats.bullet_lifespan)
+        if refill:
+            self.hull, self.shield = self.max_hull, self.max_shield
+        else:
+            self.hull = min(self.hull, self.max_hull)
+            self.shield = min(self.shield, self.max_shield)
+
+    @property
+    def stats(self) -> ShipStats:
+        return ShipStats(max_hull=self.max_hull, max_shield=self.max_shield,
+                         fire_rate=self.fire_rate, thrust_power=self.thrust_power,
+                         max_speed=self.max_speed, bullet_lifespan=self.bullet_lifespan)
 
     def respawn(self, x, y, angle, protection: int = 0):
         """Bring a destroyed (or reserve) ship back at full health."""
@@ -186,8 +246,10 @@ class Asteroid(Entity):
 
 
 class Bullet(Entity):
-    def __init__(self, x, y, vx, vy, owner_name: str, team_id: int, config: GameConfig):
+    def __init__(self, x, y, vx, vy, owner_name: str, team_id: int, config: GameConfig,
+                 lifespan: Optional[int] = None):
         super().__init__(x, y, vx, vy, config.bullet_radius)
         self.owner_name = owner_name
         self.team_id = team_id
-        self.lifespan = config.bullet_lifespan
+        self.lifespan = int(lifespan if lifespan is not None else config.bullet_lifespan)
+        self.max_lifespan = self.lifespan

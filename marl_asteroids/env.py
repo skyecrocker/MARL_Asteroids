@@ -13,14 +13,16 @@ Key properties
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
 from pettingzoo.utils.env import ParallelEnv
 
-from .config import MODES, RESPAWN_MODES, GameConfig
-from .entities import Asteroid, Bullet, Convoy, Flag, Ship, Station
+from .config import ENV_MODES, RESPAWN_MODES, ROGUELITE_MODE, GameConfig
+from .entities import Asteroid, Bullet, Convoy, Flag, Loadout, Ship, Station
+
+PLAYER = "blue_0"  # roguelite: the human's ship; the run ends when it is destroyed
 
 RED, BLUE = 0, 1
 TEAM_NAMES = ("red", "blue")
@@ -64,12 +66,12 @@ class TeamAsteroidsEnv(ParallelEnv):
         self.height = float(config.height)
         self.friendly_fire = config.friendly_fire
         self.asteroids_split = config.asteroids_split
-        if config.mode not in MODES:
-            raise ValueError(f"unknown mode {config.mode!r}; choose from {sorted(MODES)}")
+        if config.mode not in ENV_MODES:
+            raise ValueError(f"unknown mode {config.mode!r}; choose from {sorted(ENV_MODES)}")
         self.mode = config.mode
         # In respawning modes a destroyed ship is not "done": it stays in ``agents`` (with an
         # all-zero observation) until it returns, and everyone terminates together at game end.
-        self.persistent_agents = self.mode in RESPAWN_MODES
+        self.persistent_agents = self.mode in RESPAWN_MODES or self.mode == ROGUELITE_MODE
         self.stations: Dict[int, Station] = {}
         self.flags: Dict[int, Flag] = {}
         self.convoy: Optional[Convoy] = None
@@ -120,6 +122,7 @@ class TeamAsteroidsEnv(ParallelEnv):
         self.wave = 1
         self.waves_cleared = 0
         self._wave_timer: Optional[int] = None
+        self.wave_active = False                 # roguelite: a wave is being fought
         self.captures = {RED: 0, BLUE: 0}        # capture the flag score
         self.flag_log: List[Tuple[str, str, int]] = []  # (event, agent, flag team)
         self._objective_winner: Optional[int] = None  # set when a mode objective decides the game
@@ -394,6 +397,16 @@ class TeamAsteroidsEnv(ParallelEnv):
                 ship.reserve = True
                 self.ships[agent] = ship
                 continue
+            if self.mode == ROGUELITE_MODE:
+                # Only the player starts in play, at the center. Wingmen and enemies wait in
+                # reserve until start_wave() places them.
+                ship = Ship(self.width / 2, self.height / 2, team, agent, cfg, fire_rate=fire_rate)
+                ship.angle = -math.pi / 2
+                if agent != PLAYER:
+                    ship.active = False
+                    ship.reserve = True
+                self.ships[agent] = ship
+                continue
             # A blueprint with no randomness always proposes the same spot, so retrying is pointless.
             deterministic = bp is not None and not bp.random_spawn and bp.x_noise == 0 and bp.y_noise == 0
 
@@ -433,16 +446,21 @@ class TeamAsteroidsEnv(ParallelEnv):
             vx, vy = rng.normal(bp.vx, bp.vx_noise), rng.normal(bp.vy, bp.vy_noise)
             self.asteroids.append(Asteroid(x, y, vx, vy, cfg, size=bp.size))
         for _ in range(max(0, cfg.num_asteroids - len(cfg.asteroid_spawns or []))):
-            for _attempt in range(200):
-                ax, ay = rng.uniform(0, self.width), rng.uniform(0, self.height)
-                if all(self._wrapped_dist((ax, ay), s.pos) >= cfg.asteroid_clear_radius
-                       for s in self.ships.values() if s.active) and \
-                   all(self._wrapped_dist((ax, ay), st.pos) >= cfg.asteroid_clear_radius + st.radius
-                       for st in self.stations.values()):
-                    break
-            angle = rng.uniform(0, 2 * math.pi)
-            speed = rng.uniform(*cfg.asteroid_speed_range)
-            self.asteroids.append(Asteroid(ax, ay, math.cos(angle) * speed, math.sin(angle) * speed, cfg, size=3))
+            self.asteroids.append(self._random_rock())
+
+    def _random_rock(self) -> Asteroid:
+        """A large asteroid at a random spot clear of active ships and stations."""
+        cfg, rng = self.config, self.np_random
+        for _attempt in range(200):
+            ax, ay = rng.uniform(0, self.width), rng.uniform(0, self.height)
+            if all(self._wrapped_dist((ax, ay), s.pos) >= cfg.asteroid_clear_radius
+                   for s in self.ships.values() if s.active) and \
+               all(self._wrapped_dist((ax, ay), st.pos) >= cfg.asteroid_clear_radius + st.radius
+                   for st in self.stations.values()):
+                break
+        angle = rng.uniform(0, 2 * math.pi)
+        speed = rng.uniform(*cfg.asteroid_speed_range)
+        return Asteroid(ax, ay, math.cos(angle) * speed, math.sin(angle) * speed, cfg, size=3)
 
     # ---------------------------------------------------------------- physics
 
@@ -458,10 +476,12 @@ class TeamAsteroidsEnv(ParallelEnv):
             ship.angle += cfg.turn_speed
         ship.angle = (ship.angle + math.pi) % (2 * math.pi) - math.pi
 
+        # Thrust, speed cap, and bullet range are per ship (equal to the config values except in
+        # roguelite, where upgrades and enemy variants change them).
         if thrust == 1:
-            ship.vel[0] += math.cos(ship.angle) * cfg.thrust_power
-            ship.vel[1] += math.sin(ship.angle) * cfg.thrust_power
-        cap = cfg.max_speed * (cfg.flag_carrier_speed if self.carrying(agent_name) else 1.0)
+            ship.vel[0] += math.cos(ship.angle) * ship.thrust_power
+            ship.vel[1] += math.sin(ship.angle) * ship.thrust_power
+        cap = ship.max_speed * (cfg.flag_carrier_speed if self.carrying(agent_name) else 1.0)
         speed = math.hypot(ship.vel[0], ship.vel[1])
         if speed > cap:
             ship.vel *= cap / speed
@@ -472,7 +492,8 @@ class TeamAsteroidsEnv(ParallelEnv):
             by = ship.pos[1] + s * (ship.radius + 5)
             bvx = ship.vel[0] + c * cfg.bullet_speed
             bvy = ship.vel[1] + s * cfg.bullet_speed
-            self.bullets.append(Bullet(bx, by, bvx, bvy, agent_name, ship.team_id, cfg))
+            self.bullets.append(Bullet(bx, by, bvx, bvy, agent_name, ship.team_id, cfg,
+                                       lifespan=ship.bullet_lifespan))
             ship.cooldown = ship.fire_rate
 
     def _step_physics(self):
@@ -684,6 +705,9 @@ class TeamAsteroidsEnv(ParallelEnv):
 
     def _team_out(self, team: int) -> bool:
         """Has this team lost every way to keep playing?"""
+        if self.mode == ROGUELITE_MODE:
+            # The run ends with the player's ship, even if wingmen survive; red is endless.
+            return team == BLUE and not self.ships[PLAYER].active
         if self._team_alive(team) > 0:
             return False
         if self.mode == "siege":
@@ -821,6 +845,92 @@ class TeamAsteroidsEnv(ParallelEnv):
                     self._wave_timer = None
                     self.wave += 1
                     self._spawn_wave(self.wave)
+        elif self.mode == ROGUELITE_MODE:
+            # No timer and no respawns here: the run controller opens the shop and calls
+            # start_wave() for the next one.
+            if self.wave_active and self._team_alive(RED) == 0 and self.ships[PLAYER].active:
+                self.wave_active = False
+                self.waves_cleared += 1
+
+    # ------------------------------------------------------------- roguelite
+
+    def start_wave(self, wave: int, enemies: Sequence[Loadout], fleet: Mapping[str, Loadout]):
+        """Roguelite only: set up wave ``wave``.
+
+        ``fleet`` maps blue agents (``blue_0`` = the player, then wingmen) to their loadouts. Each is
+        refilled to full health with its stats applied; fallen wingmen respawn next to the player.
+        Blue slots not in ``fleet`` stay in reserve. Then ``len(enemies)`` red slots are placed far
+        from blue and the rest go to reserve.
+        """
+        if self.mode != ROGUELITE_MODE:
+            raise ValueError("start_wave() is only for the roguelite mode")
+        if len(enemies) > self.n_red:
+            raise ValueError(f"{len(enemies)} enemies but only {self.n_red} red slots")
+        unknown = set(fleet) - set(self.team_agents[BLUE])
+        if unknown or PLAYER not in fleet:
+            raise ValueError(f"fleet must include {PLAYER} and only blue slots (got {sorted(fleet)})")
+        cfg = self.config
+        player = self.ships[PLAYER]
+        for agent in self.team_agents[BLUE]:  # PLAYER first, so wingmen can form up on it
+            ship = self.ships[agent]
+            loadout = fleet.get(agent)
+            if loadout is None:
+                ship.active, ship.reserve, ship.respawn_timer = False, True, None
+                continue
+            ship.apply_stats(loadout.stats, refill=True)
+            ship.variant, ship.tier = loadout.variant, loadout.tier
+            if not ship.active:
+                if agent == PLAYER:
+                    raise ValueError("the player's ship is destroyed: the run is over")
+                x, y, heading = self._near_ally_spawn()
+                ship.respawn(x, y, heading, protection=cfg.spawn_protection)
+        self.bullets = []
+        self._replenish_asteroids()
+        reds = self.team_agents[RED]
+        for k, agent in enumerate(reds):
+            ship = self.ships[agent]
+            if k < len(enemies):
+                loadout = enemies[k]
+                ship.apply_stats(loadout.stats, refill=True)
+                ship.variant, ship.tier = loadout.variant, loadout.tier
+                x, y, heading = self._roguelite_enemy_spawn(player.pos)
+                ship.respawn(x, y, heading, protection=cfg.spawn_protection)
+            else:
+                ship.active, ship.reserve, ship.respawn_timer = False, True, None
+                ship.variant = ship.tier = None
+        self.wave = int(wave)
+        self.wave_active = True
+        self._compute_obs()
+        self._phi = self._potentials()
+
+    def _roguelite_enemy_spawn(self, anchor) -> Tuple[float, float, float]:
+        """A far spawn (see _far_spawn); if none was found far enough, fall back to near the point
+        opposite the player on the torus, which is always the farthest place on the map."""
+        cfg = self.config
+        min_d = cfg.wave_spawn_distance * min(self.width, self.height)
+        blues = [s.pos for a, s in self.ships.items() if self.team_of[a] == BLUE and s.active]
+        x, y, heading = self._far_spawn(away_from=BLUE)
+        if all(self._wrapped_dist((x, y), p) >= min_d for p in blues):
+            return x, y, heading
+        rng = self.np_random
+        r, a = rng.uniform(0, 100.0), rng.uniform(-math.pi, math.pi)
+        x = (anchor[0] + self.width / 2 + math.cos(a) * r) % self.width
+        y = (anchor[1] + self.height / 2 + math.sin(a) * r) % self.height
+        dx, dy, _ = self.wrapped_delta((x, y), anchor)
+        return x, y, math.atan2(dy, dx)
+
+    def _replenish_asteroids(self):
+        """Roguelite: top the field back up to the configured number of large rocks between
+        waves, so a long run doesn't end up in empty space once everything has been shot apart."""
+        large = sum(1 for a in self.asteroids if a.active and a.size == 3)
+        for _ in range(max(0, self.config.num_asteroids - large)):
+            self.asteroids.append(self._random_rock())
+
+    def ship_stats(self, agent: str) -> Dict[str, float]:
+        """A ship's stats as plain numbers (for HUDs, tests, and future observation features)."""
+        out = self.ships[agent].stats.as_dict()
+        out["bullet_range"] = float(self.config.bullet_speed * out["bullet_lifespan"])
+        return out
 
     def _near_ally_spawn(self) -> Tuple[float, float, float]:
         """Survival: return a fallen blue ship next to a living teammate (or the map center)."""
@@ -843,7 +953,7 @@ class TeamAsteroidsEnv(ParallelEnv):
             out["stations"] = {team: {"hp": st.hp, "max_hp": st.max_hp, "alive": st.active}
                                for team, st in self.stations.items()}
             out["station_damage"] = dict(self.station_damage)
-        elif self.mode == "survival":
+        elif self.mode in ("survival", ROGUELITE_MODE):
             out["waves_cleared"] = self.waves_cleared
             out["wave"] = self.wave
         elif self.mode == "deathmatch":

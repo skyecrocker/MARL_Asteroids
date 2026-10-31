@@ -42,10 +42,12 @@ def _steer(angle_diff, tol=0.1):
 
 
 def heuristic_action(env, agent_name, rng, p: float = 1.0, danger_zone: float = 100.0,
-                     collision_margin: float = 3.5):
+                     collision_margin: float = 3.5, standoff: float = 150.0):
     """The original 'smart' bot: flee the nearest threat, otherwise turn to the enemy and shoot.
 
     With probability ``1 - p`` it does nothing this step (the legacy "p% optimal" knob).
+    ``standoff`` is how close (px) it closes on its target before it stops thrusting; roguelite
+    snipers keep a longer one.
 
     ``collision_margin`` (in ego radii) adds a late break-off from imminent ship contact. Without it
     the bot coasts straight into whatever it is shooting at and trades itself away by ramming, which
@@ -104,7 +106,8 @@ def heuristic_action(env, agent_name, rng, p: float = 1.0, danger_zone: float = 
     if tgt is None:
         return NOOP.copy()
     diff = _angle_diff(math.atan2(tgt[1], tgt[0]), ego.angle)
-    return np.array([1 if abs(diff) < 0.5 and best > 150 else 0, _steer(diff), 1 if abs(diff) < 0.2 else 0])
+    return np.array([1 if abs(diff) < 0.5 and best > standoff else 0, _steer(diff),
+                     1 if abs(diff) < 0.2 else 0])
 
 
 # ------------------------------------------------------------- objective-mode helpers
@@ -361,6 +364,42 @@ class DelayedPolicy(Policy):
             state[1].append(obs[i])
             delayed[i] = state[1][0]
         return self.inner.act(delayed, contexts)
+
+
+class ReactionDelayPolicy(Policy):
+    """Reaction time for any policy, scripted bots included: each ship carries out the action it
+    chose ``delay`` decisions ago. (``DelayedPolicy`` delays observations instead, which scripted
+    bots never read.)
+
+    Queues are per (env, agent). A ship that skipped decisions (it was destroyed or in reserve) or a
+    new episode starts from an empty queue filled with no-ops, so it never replays stale actions.
+    """
+
+    def __init__(self, inner: Policy, delay: int):
+        self.inner = inner
+        self.delay = max(0, int(delay))
+        self.name = f"{inner.name}+react{self.delay}"
+        self._queues: dict = {}
+
+    def reset(self):
+        self._queues.clear()
+
+    def act(self, obs, contexts):
+        fresh = self.inner.act(obs, contexts)
+        if self.delay <= 0 or len(contexts) == 0:
+            return fresh
+        out = np.empty_like(fresh)
+        for i, (env, agent) in enumerate(contexts):
+            key = (id(env), agent)
+            state = self._queues.get(key)
+            step = env.decision_step
+            if state is None or step != state[0] + 1:
+                state = [step - 1, deque([NOOP.copy()] * self.delay)]
+                self._queues[key] = state
+            state[0] = step
+            state[1].append(fresh[i])
+            out[i] = state[1].popleft()
+        return out
 
 
 class HumanPolicy(Policy):
