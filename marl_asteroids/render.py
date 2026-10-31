@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -24,6 +24,146 @@ TEAM_COLORS = {
     RED: {"hull": (255, 96, 88), "glow": (255, 40, 40), "trail": (120, 30, 30)},
     BLUE: {"hull": (96, 176, 255), "glow": (40, 140, 255), "trail": (26, 70, 120)},
 }
+# --- Roguelite looks. Variants differ by silhouette, intelligence tiers by shade, pips and a ring.
+# Shapes are (angle offset from the heading, radius multiple) vertex lists. Hitboxes stay circles of
+# ship.radius whatever the silhouette.
+SHAPES = {
+    "standard": ((0.0, 1.45), (2.45, 1.0), (math.pi, 0.45), (-2.45, 1.0)),
+    # slim dart with a forked tail
+    "scout": ((0.0, 1.6), (2.2, 0.75), (2.75, 1.35), (math.pi, 0.35), (-2.75, 1.35), (-2.2, 0.75)),
+    "heavy": ((0.0, 1.3), (1.2, 1.2), (2.3, 1.25), (math.pi, 0.9), (-2.3, 1.25), (-1.2, 1.2)),
+    # long barrel on a small cross-winged body
+    "sniper": ((0.0, 2.2), (0.12, 1.0), (1.4, 0.75), (2.5, 1.1), (math.pi, 0.5), (-2.5, 1.1),
+               (-1.4, 0.75), (-0.12, 1.0)),
+    "wingman": ((0.0, 1.35), (2.0, 1.15), (2.7, 0.6), (math.pi, 0.5), (-2.7, 0.6), (-2.0, 1.15)),
+}
+DEFAULT_SHAPE = SHAPES["standard"]
+# tier -> (body, pips, ring) for enemies; bodies stay red-dominant
+ENEMY_TIER_STYLE = {
+    "basic": ((255, 112, 100), 0, False),
+    "veteran": ((228, 62, 52), 1, False),
+    "elite": ((176, 22, 70), 2, True),
+}
+WINGMAN_BODY = (120, 220, 235)
+WINGMAN_TIER_PIPS = {"basic": (0, False), "veteran": (1, False), "elite": (2, True)}
+ENEMY_PIP = (255, 206, 84)
+WINGMAN_PIP = (245, 250, 255)
+ELITE_RING = (255, 190, 70)
+
+
+@dataclass(frozen=True)
+class ShipLook:
+    shape: tuple
+    body: Tuple[int, int, int]
+    pips: int = 0
+    pip_color: Tuple[int, int, int] = (255, 255, 255)
+    ring: Optional[Tuple[int, int, int]] = None
+
+
+def ship_look(ship) -> ShipLook:
+    """How a ship is drawn, from its team, roguelite variant and intelligence tier. Ships without a
+    variant (every existing mode, and your own ship) keep the classic arrowhead in team colors."""
+    variant = getattr(ship, "variant", None)
+    tier = getattr(ship, "tier", None)
+    if variant is None:
+        return ShipLook(DEFAULT_SHAPE, TEAM_COLORS[ship.team_id]["hull"])
+    if variant == "wingman":
+        pips, ring = WINGMAN_TIER_PIPS.get(tier, (0, False))
+        return ShipLook(SHAPES["wingman"], WINGMAN_BODY, pips, WINGMAN_PIP,
+                        WINGMAN_PIP if ring else None)
+    body, pips, ring = ENEMY_TIER_STYLE.get(tier, ENEMY_TIER_STYLE["basic"])
+    if ship.team_id != RED:  # never happens in play; keep team colors honest anyway
+        body = TEAM_COLORS[ship.team_id]["hull"]
+    return ShipLook(SHAPES.get(variant, DEFAULT_SHAPE), body, pips, ENEMY_PIP,
+                    ELITE_RING if ring else None)
+
+
+def draw_look(surface, look: ShipLook, center, angle: float, radius_px: float,
+              edge=(250, 250, 255), edge_width: int = 2):
+    """Draw a ship look at a pixel ``center`` (used by the renderer and the legend)."""
+    import pygame
+
+    cx, cy = center
+    pts = [(int(cx + math.cos(angle + o) * radius_px * m), int(cy + math.sin(angle + o) * radius_px * m))
+           for o, m in look.shape]
+    pygame.draw.polygon(surface, look.body, pts)
+    pygame.draw.polygon(surface, edge, pts, max(1, edge_width))
+    draw_marks(surface, look, center, angle, radius_px)
+
+
+def draw_marks(surface, look: ShipLook, center, angle: float, radius_px: float):
+    """Intelligence markings: pips across the hull and, for elites, a ring."""
+    import pygame
+
+    cx, cy = center
+    if look.pips:
+        # Pips sit side by side across the hull, just behind the center
+        px, py = -math.sin(angle), math.cos(angle)
+        bx, by = cx - math.cos(angle) * radius_px * 0.15, cy - math.sin(angle) * radius_px * 0.15
+        pr = max(2, int(round(radius_px * 0.3)))
+        for i in range(look.pips):
+            off = (i - (look.pips - 1) / 2) * radius_px * 0.7
+            c = (int(bx + px * off), int(by + py * off))
+            pygame.draw.circle(surface, (20, 14, 24), c, pr + 1)  # dark rim: readable on any body
+            pygame.draw.circle(surface, look.pip_color, c, pr)
+    if look.ring is not None:
+        pygame.draw.circle(surface, look.ring, (int(cx), int(cy)), max(6, int(radius_px * 2.0)), 1)
+
+
+LEGEND_VARIANTS = (("standard", "Standard", "balanced"), ("scout", "Scout", "fast, fragile"),
+                   ("heavy", "Heavy", "slow, tough"), ("sniper", "Sniper", "long range"))
+LEGEND_TIERS = (("basic", "Basic", "slow to react"), ("veteran", "Veteran", "sharper"),
+                ("elite", "Elite", "fast and accurate"))
+
+
+class _LegendShip:
+    def __init__(self, variant, tier, team=RED):
+        self.variant, self.tier, self.team_id = variant, tier, team
+
+
+def legend_height(row: int = 26) -> int:
+    return 3 * 24 + 2 * 8 + row * (len(LEGEND_VARIANTS) + len(LEGEND_TIERS) + 1) + 8
+
+
+def draw_legend(surface, rect, font, row: int = 26, title_color=(226, 232, 245),
+                hints: Optional[bool] = None):
+    """Key for enemy variants (silhouette), intelligence tiers (shade, pips, ring) and wingmen.
+    ``hints`` adds a short description per row (default: when ``rect`` is wide enough)."""
+    x, y = rect[0], rect[1]
+    if hints is None:
+        hints = len(rect) < 3 or rect[2] >= 270
+    dim = (130, 142, 166)
+    icon_r = max(6.0, row * 0.33)
+    first = True
+
+    def heading(text):
+        nonlocal y, first
+        if not first:
+            y += 8
+        first = False
+        surface.blit(font.render(text, True, title_color), (x, y))
+        y += 24
+
+    def entry(look, name, hint):
+        nonlocal y
+        draw_look(surface, look, (x + 16, y + row // 2), -math.pi / 2, icon_r, edge_width=1)
+        surface.blit(font.render(name, True, title_color), (x + 40, y + row // 2 - 9))
+        if hints:
+            surface.blit(font.render(hint, True, dim), (x + 48 + max(font.size(name)[0], 70),
+                                                        y + row // 2 - 9))
+        y += row
+
+    heading("Enemy types")
+    for v, name, hint in LEGEND_VARIANTS:
+        entry(ship_look(_LegendShip(v, "basic")), name, hint)
+    heading("Enemy intelligence")
+    for t, name, hint in LEGEND_TIERS:
+        entry(ship_look(_LegendShip("standard", t)), name, hint)
+    heading("Your fleet")
+    entry(ship_look(_LegendShip("wingman", "basic", BLUE)), "Wingman", "AI ally")
+    return y - rect[1]
+
+
 ROCK_FILL = (74, 70, 86)
 ROCK_EDGE = (150, 146, 168)
 BULLET_CORE = (255, 255, 235)
@@ -61,13 +201,17 @@ class RenderState:
 class Renderer:
     def __init__(self, env, window: int = 1000, show_hud: bool = True, effects: bool = True,
                  trail_length: int = 18, follow: Optional[str] = None, view_size: float = 1200.0,
-                 minimap: bool = True, show_obs: bool = False, obs_agent: Optional[str] = None):
+                 minimap: bool = True, show_obs: bool = False, obs_agent: Optional[str] = None,
+                 hud_text: Optional[Callable[[], str]] = None):
         """
         Args:
             follow: agent name to keep centered. None renders the whole map scaled to the window.
             view_size: world units across the viewport in follow mode (clamped to the map size).
             minimap: draw a whole-map inset in follow mode.
+            hud_text: optional callback for the line at the top center (roguelite: wave, enemies
+                left, credits), replacing the clock.
         """
+        self.hud_text = hud_text
         self.env = env
         self.window = window
         self.show_hud = show_hud
@@ -435,9 +579,9 @@ class Renderer:
             if not ship.active:
                 continue
             col = TEAM_COLORS[ship.team_id]
+            look = ship_look(ship)
             a, r = ship.angle, ship.radius
-            hull_offs = [(math.cos(a + o) * r * m, math.sin(a + o) * r * m)
-                         for o, m in ((0.0, 1.45), (2.45, 1.0), (math.pi, 0.45), (-2.45, 1.0))]
+            hull_offs = [(math.cos(a + o) * r * m, math.sin(a + o) * r * m) for o, m in look.shape]
             flame_offs = None
             if self.effects and ship.thrusting:  # thruster flame opposite the heading
                 flick = 0.75 + 0.5 * self.rng.random()
@@ -448,12 +592,12 @@ class Renderer:
                               (math.cos(back - 0.85) * r * 0.5, math.sin(back - 0.85) * r * 0.5),
                               (math.cos(back) * r * 0.5, math.sin(back) * r * 0.5)]
                 flame_col = (255, int(150 + 80 * flick), 60)
-            body = col["hull"]
+            body = look.body
             if self.effects and st.flash.get(name, 0) > 0:  # white flash on taking damage
                 body = (255, 255, 255)
             # Bright outline while armed, dim while reloading: readable weapon state at a glance.
             armed = ship.cooldown <= 0
-            edge = (250, 250, 255) if armed else tuple(int(c * 0.45) for c in col["hull"])
+            edge = (250, 250, 255) if armed else tuple(int(c * 0.45) for c in look.body)
             # Radius covers the flame, the health bar above the ship, and the reload dot
             for center in images(ship.pos, r * 3.0):
                 if flame_offs is not None:
@@ -461,6 +605,8 @@ class Renderer:
                 hull = [at(center, o) for o in hull_offs]
                 pygame.draw.polygon(surf, body, hull)
                 pygame.draw.polygon(surf, edge, hull, max(1, int(2.0 * s)))
+                if look.pips or look.ring is not None:  # roguelite intelligence markings
+                    draw_marks(surf, look, center, a, r * s)
                 if ship.protection > 0 and (env.frame // 5) % 2 == 0:  # spawn protection: pulsing bubble
                     pygame.draw.circle(surf, (190, 225, 255), (int(center[0]), int(center[1])),
                                        max(6, int(r * 1.9 * s)), 1)
@@ -887,8 +1033,15 @@ class Renderer:
                 center = f"Wave {env.wave + 1} in {env.wave_cooldown / 60:.0f}s   {center}"
             else:
                 center = f"Wave {env.wave}  ·  {red} left   {center}"
-        t = self.font.render(center, True, HUD_DIM if env.mode != "survival" else HUD_TEXT)
+        if self.hud_text is not None:
+            center = self.hud_text()
+        bright = env.mode in ("survival", "roguelite") or self.hud_text is not None
+        t = self.font.render(center, True, HUD_TEXT if bright else HUD_DIM)
         surf.blit(t, ((surf.get_width() - t.get_width()) // 2, 12))
+        if env.mode == "roguelite" and not env.wave_active and not env.game_over and env.frame > 0:
+            m = self.font_big.render(f"WAVE {env.wave} CLEARED", True, (150, 235, 170))
+            surf.blit(m, ((surf.get_width() - m.get_width()) // 2,
+                          (surf.get_height() - m.get_height()) // 2))
         # The followed ship is down: say when (or whether) it comes back
         followed = env.ships.get(self.follow) if self.follow else None
         if followed is not None and not followed.active and not env.game_over:
@@ -912,6 +1065,8 @@ class Renderer:
             if env.mode == "survival":
                 n = env.waves_cleared
                 msg = f"SURVIVED {n} WAVE{'S' if n != 1 else ''}"
+            elif env.mode == "roguelite":
+                msg = f"RUN OVER · WAVE {env.wave}"
             color = TEAM_COLORS.get(env.winner, {}).get("hull", HUD_TEXT)
             surface = self.font_big.render(msg, True, color)
             surf.blit(surface, ((surf.get_width() - surface.get_width()) // 2,
