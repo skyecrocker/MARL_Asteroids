@@ -594,7 +594,8 @@ class GameScreen(MenuScreen):
         self.env = self.match.make_env()
         self.renderer = Renderer(self.env, window=self.side, follow=self.match.follow,
                                  view_size=self.match.spec.view, effects=s.effects,
-                                 minimap=s.minimap, show_obs=s.show_obs)
+                                 minimap=s.minimap, show_obs=s.show_obs,
+                                 thruster_particles=s.thruster_particles)
         self.env.on_frame = self._on_frame
         self.who = {}  # roster labels, computed once rather than every frame
         for agent, controller in self.match.assignment.items():
@@ -962,7 +963,7 @@ class RogueliteGameScreen(GameScreen):
         self.env = self.run.make_env()
         self.renderer = Renderer(self.env, window=self.side, follow=PLAYER, view_size=ROGUELITE_VIEW,
                                  effects=s.effects, minimap=s.minimap, show_obs=s.show_obs,
-                                 hud_text=self.run.hud_text)
+                                 hud_text=self.run.hud_text, thruster_particles=s.thruster_particles)
         self.env.on_frame = self._on_frame
         self.run.start()
         self.paused = False
@@ -1225,7 +1226,8 @@ class SettingsScreen(MenuScreen):
         self.choice((x + lw, y, fw, 34), sizes, current, self.app.set_window_size)
         y += 50
         on_off = [("On", True), ("Off", False)]
-        for label, key in (("Visual effects", "effects"), ("Minimap", "minimap"),
+        for label, key in (("Visual effects", "effects"), ("Engine particles", "thruster_particles"),
+                           ("Minimap", "minimap"),
                            ("Sensor view by default", "show_obs"), ("Menu background match", "attract_mode")):
             self.label((x, y, lw, 34), label)
             self.choice((x + lw, y, fw, 34), on_off, getattr(s, key),

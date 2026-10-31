@@ -29,6 +29,7 @@ def config_path() -> Path:
 class AppSettings:
     window: List[int] = field(default_factory=lambda: list(WINDOW_SIZES[0]))
     effects: bool = True          # particles, trails, flames, screen shake
+    thruster_particles: bool = True  # engine exhaust as particles (off: the classic flame)
     minimap: bool = True
     show_obs: bool = False        # observation overlay on by default (Tab toggles in game)
     attract_mode: bool = True     # live AI match playing behind the main menu

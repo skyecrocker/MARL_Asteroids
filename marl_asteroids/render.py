@@ -168,6 +168,9 @@ ROCK_FILL = (74, 70, 86)
 ROCK_EDGE = (150, 146, 168)
 BULLET_CORE = (255, 255, 235)
 HUD_TEXT = (226, 232, 245)
+THRUST_COLOR = (255, 190, 90)  # engine exhaust, fades to black with age
+THRUST_PER_FRAME = 2           # sparks per thrusting ship per rendered frame
+THRUST_MAX_PARTICLES = 400     # cap on live exhaust sparks across all ships
 HUD_DIM = (120, 132, 156)
 
 
@@ -202,7 +205,7 @@ class Renderer:
     def __init__(self, env, window: int = 1000, show_hud: bool = True, effects: bool = True,
                  trail_length: int = 18, follow: Optional[str] = None, view_size: float = 1200.0,
                  minimap: bool = True, show_obs: bool = False, obs_agent: Optional[str] = None,
-                 hud_text: Optional[Callable[[], str]] = None):
+                 hud_text: Optional[Callable[[], str]] = None, thruster_particles: bool = True):
         """
         Args:
             follow: agent name to keep centered. None renders the whole map scaled to the window.
@@ -212,6 +215,7 @@ class Renderer:
                 left, credits), replacing the clock.
         """
         self.hud_text = hud_text
+        self.thruster_particles = thruster_particles  # off: the classic polygon flame
         self.env = env
         self.window = window
         self.show_hud = show_hud
@@ -425,6 +429,38 @@ class Renderer:
                 self._spawn_burst(b.pos[0], b.pos[1], 5, 1.1, c["glow"], 9, 2.0)
         st.prev_bullets = n
 
+    def _spawn_thrust(self):
+        """Engine exhaust: a few short-lived sparks per thrusting ship each frame, behind the ship.
+
+        Only ships on screen spawn them, and the total is capped, so the cost stays flat as ships
+        are added. Exhaust is only spawned here (rendering), never in the env, so training is
+        unaffected."""
+        if not self.thruster_particles:
+            return
+        env, st = self.env, self.state
+        cam = self._camera_center()
+        live = sum(1 for p in st.particles if p.kind == "thrust")
+        budget = THRUST_MAX_PARTICLES - live
+        for ship in env.ships.values():
+            if budget <= 0:
+                break
+            if not ship.active or ship.reserve or not ship.thrusting:
+                continue
+            if not self._visible(ship.pos, cam, margin=ship.radius * 4):
+                continue
+            back = ship.angle + math.pi
+            ex = ship.pos[0] + math.cos(back) * ship.radius
+            ey = ship.pos[1] + math.sin(back) * ship.radius
+            for _ in range(THRUST_PER_FRAME):
+                spread = (self.rng.random() - 0.5) * 0.5
+                speed = 1.0 + 1.2 * self.rng.random()
+                vx = math.cos(back + spread) * speed + ship.vel[0] * 0.5
+                vy = math.sin(back + spread) * speed + ship.vel[1] * 0.5
+                life = 9.0 + 6.0 * self.rng.random()
+                st.particles.append(Particle(ex, ey, vx, vy, life, life, 2.2,
+                                             THRUST_COLOR, "thrust"))
+            budget -= THRUST_PER_FRAME
+
     def _update_particles(self):
         st = self.state
         alive = []
@@ -468,6 +504,7 @@ class Renderer:
 
         if self.effects:
             self._detect_events()
+            self._spawn_thrust()
             self._update_particles()
             self._update_trails()
 
@@ -583,7 +620,7 @@ class Renderer:
             a, r = ship.angle, ship.radius
             hull_offs = [(math.cos(a + o) * r * m, math.sin(a + o) * r * m) for o, m in look.shape]
             flame_offs = None
-            if self.effects and ship.thrusting:  # thruster flame opposite the heading
+            if self.effects and ship.thrusting and not self.thruster_particles:  # classic flame
                 flick = 0.75 + 0.5 * self.rng.random()
                 back = a + math.pi
                 flame_offs = [(math.cos(back + 0.85) * r * 0.5, math.sin(back + 0.85) * r * 0.5),
@@ -631,7 +668,6 @@ class Renderer:
             if agent is not None:
                 self._draw_obs_overlay(surf, to_px, agent)
         if self.follow is not None:
-            self._highlight_followed(surf, to_px)
             if self.minimap:
                 self._draw_minimap(surf, cam)
             # Drawn last so edge contacts are never clipped by the minimap inset
@@ -809,16 +845,6 @@ class Renderer:
     def _wrapped_delta(self, a, b):
         w, h = self.env.width, self.env.height
         return ((b[0] - a[0] + w / 2) % w - w / 2, (b[1] - a[1] + h / 2) % h - h / 2)
-
-    def _highlight_followed(self, surf, to_px):
-        """Ring the ship under the player's control so it is unmistakable in a crowd."""
-        import pygame
-
-        ship = self.env.ships.get(self.follow)
-        if ship is None or not ship.active:
-            return
-        r = max(8, int(ship.radius * self.scale * 2.2))
-        pygame.draw.circle(surf, (235, 240, 255), to_px(ship.pos), r, 1)
 
     def _draw_offscreen_markers(self, surf, cam):
         """Edge chevrons for ships outside the viewport, with distance in world units."""
