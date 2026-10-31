@@ -64,6 +64,9 @@ AI. Your last setup is remembered.
 | **Station siege** | Each team has a station. Destroyed ships respawn at it after 3 s, with 1.5 s of spawn protection. Destroy the enemy station to stop their respawns, then wipe out the fleet. Default limit 5 min; the station with more health wins a timeout. |
 | **Survival** | Blue against growing waves of red. The first wave is half blue's size; each wave adds one more enemy, up to 20 on screen at once. One Enemies dropdown sets the AI for every wave. Clearing a wave brings fallen blue ships back and repairs every hull. Lasting until a time limit counts as a win. |
 
+| **Capture the flag** | Each team has a base with its flag, half a map apart. Fly through the enemy flag to take it and through your own base to score (your own flag doesn't need to be home). Carriers fly at 70% speed. A destroyed carrier drops the flag: its owners touch it to send it home, the enemy can grab it again, and it returns by itself after 15 s. Ships respawn at their base. First to 3 captures wins; most captures at the 5 min limit, or a draw if level. |
+| **Escort** | Blue escorts an unarmed convoy 70% of the way across the map. It only moves while a blue ship is within 250 px, and its shield regenerates like a station's (1.2 points/s), so slowing it takes a coordinated attack. Blue wins on delivery; red wins by destroying it or when the clock (5 min) runs out. Both sides respawn: blue around the convoy, red away from it. |
+
 A station's shield regenerates continuously at 1.6 points/s, between one and two ships' damage
 output, so a lone attacker barely dents it while two or three take it down in 10-25 s
 (`tests/test_modes.py` pins this). Your own fire passes through your station; ships bounce off any
@@ -71,7 +74,7 @@ station, and ramming an enemy one hurts only the ship.
 
 The trained agents were trained on sudden death but fight just as well in deathmatch. They can't
 see stations or waves, so picking siege or survival swaps AI ships to the objective-aware scripted
-bot; you can still pick a trained agent.
+bot; you can still pick a trained agent. The same goes for capture the flag and escort.
 
 In game: `W`/`Up` thrust, `A`/`D` or arrows to turn, `Space` to shoot, `Esc` to pause (resume,
 restart, change setup, main menu), `Tab` for the sensor view.

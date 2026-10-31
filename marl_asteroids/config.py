@@ -61,6 +61,11 @@ class RewardConfig:
     station_damage: float = 0.05
     station_kill: float = 1.0
 
+    # Capture the flag: picking up the enemy flag, capturing it, and returning your own
+    flag_pickup: float = 0.2
+    flag_capture: float = 1.0
+    flag_return: float = 0.2
+
     # Potential-based shaping F = gamma * phi(s') - phi(s); preserves the optimal policy.
     shaping_scale: float = 0.1
     shaping_gamma: float = 0.995  # Should match the learner's discount
@@ -164,6 +169,25 @@ class GameConfig:
     wave_growth: int = 1
     wave_delay: int = 150           # Frames between clearing a wave and the next one arriving
     wave_spawn_distance: float = 0.35  # New enemies appear at least this fraction of the map away
+
+    # Capture the flag. Bases sit at ``station_x`` like siege stations. Fly through the enemy flag
+    # to take it and through your own base to score; touch your own dropped flag to send it home.
+    flag_radius: float = 26.0         # pickup / capture distance from a flag or base center
+    flag_return_time: int = 900       # frames a dropped flag waits before going home by itself
+    flag_carrier_speed: float = 0.7   # carrier speed cap as a fraction of max_speed
+    captures_to_win: int = 3
+
+    # Escort. Blue escorts a convoy from x = convoy_start to convoy_start + convoy_route (fractions
+    # of the map width) along the middle. It only moves while a blue ship is within convoy_escort_radius,
+    # and its shield regenerates like a station's, so stopping it takes a coordinated attack.
+    convoy_radius: float = 30.0
+    convoy_hull: int = 24
+    convoy_shield: int = 10
+    convoy_shield_regen: float = 1.2   # shield points per second (weaker than a station's 1.6)
+    convoy_speed: float = 0.45         # px per frame while escorted
+    convoy_escort_radius: float = 250.0
+    convoy_start: float = 0.15
+    convoy_route: float = 0.7
 
     # Episode. ``max_frames=None`` means no truncation at all (used by the demo scenarios so a
     # human game never ends on a clock). Training scenarios must keep a limit.
@@ -330,17 +354,22 @@ MODES: Dict[str, str] = {
     "siege": "Ships respawn while their station stands. Destroy the enemy station, then their "
              "fleet. A lone ship can't break a station's shield.",
     "survival": "Blue holds out against growing waves of red. Fallen allies return between waves.",
+    "ctf": "Take the enemy flag to your base. Carriers fly slower. First to 3 captures wins.",
+    "escort": "Blue escorts a convoy across the map; it only moves with a blue ship nearby. "
+              "Red wins by destroying it or running out the clock.",
 }
 MODE_NAMES: Dict[str, str] = {"deathmatch": "Deathmatch", "sudden_death": "Sudden death",
-                              "siege": "Station siege", "survival": "Survival"}
+                              "siege": "Station siege", "survival": "Survival",
+                              "ctf": "Capture the flag", "escort": "Escort"}
 # Default time limit per mode in seconds (None = no limit). Deathmatch needs one (that's how it
 # ends); siege gets one because it can stall if both teams turtle (healthier station wins).
 MODE_TIME_LIMIT: Dict[str, Optional[float]] = {"deathmatch": 300.0, "sudden_death": None,
-                                               "siege": 300.0, "survival": None}
+                                               "siege": 300.0, "survival": None,
+                                               "ctf": 300.0, "escort": 300.0}
 MAX_TEAM_SIZE = 8          # ships per team the app offers
 SURVIVAL_MAX_ENEMIES = 20  # enemy pool in survival: waves grow by one each until this many at once
 # Modes where destroyed ships come back. In these the env keeps every agent until the game ends.
-RESPAWN_MODES = ("deathmatch", "siege", "survival")
+RESPAWN_MODES = ("deathmatch", "siege", "survival", "ctf", "escort")
 
 ARENA_SIZES: Dict[str, float] = {"mini": 600.0, "small": 1200.0, "medium": 2400.0, "large": 4800.0}
 # Roughly constant density up to medium, sparser on large so it doesn't become an asteroid field

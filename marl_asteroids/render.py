@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from .entities import Convoy
 from .env import BLUE, RED
 
 # Palette
@@ -389,7 +390,18 @@ class Renderer:
                     pygame.draw.circle(surf, (58, 55, 68), at(center, off), max(1, int(cr * s)))
                 pygame.draw.polygon(surf, ROCK_EDGE, pts, max(1, int(1.8 * s)))
 
-        # Stations (siege)
+        # Escort route: a dashed line from the convoy to its destination, and the destination gate
+        if env.convoy is not None and env.convoy.active:
+            self._draw_route(surf, images, at)
+        # Capture the flag bases (and flags sitting at them or dropped in space)
+        for team, flag in env.flags.items():
+            for center in images(flag.base, env.config.flag_radius * 2):
+                self._draw_base(surf, team, center)
+            if flag.carrier is None:
+                for center in images(flag.pos, 40):
+                    self._draw_flag(surf, team, center, dropped=flag.drop_timer is not None)
+
+        # Stations (siege) and the escort convoy
         for team, station in env.stations.items():
             for center in images(station.pos, station.radius * 1.7):
                 self._draw_station(surf, station, center, at)
@@ -459,6 +471,15 @@ class Renderer:
                                        nose, max(1, int(2.6 * s * frac)))
                 self._draw_health_bar(surf, ship, center)
 
+        for team, flag in env.flags.items():  # flags trail behind their carriers
+            if flag.carrier is not None:
+                ship = env.ships[flag.carrier]
+                back = ship.angle + math.pi
+                for center in images(ship.pos, 40):
+                    self._draw_flag(surf, team, at(center, (math.cos(back) * ship.radius * 1.6,
+                                                            math.sin(back) * ship.radius * 1.6)),
+                                    small=True)
+
         if self.show_obs:
             agent = self.obs_agent or self.follow or next(iter(env.ships), None)
             if agent is not None:
@@ -481,6 +502,51 @@ class Renderer:
             return surf
         return np.transpose(np.array(pygame.surfarray.pixels3d(surf)), (1, 0, 2)).copy()
 
+    def _draw_route(self, surf, images, at):
+        import pygame
+        env = self.env
+        convoy = env.convoy
+        remaining = env.route_length - convoy.distance
+        col = TEAM_COLORS[BLUE]["trail"]
+        for center in images(convoy.pos, remaining + 60):
+            x = 0.0
+            while x < remaining:  # dashes toward +x
+                a = at(center, (x, 0.0))
+                b = at(center, (min(x + 18, remaining), 0.0))
+                pygame.draw.line(surf, col, a, b, max(1, int(2 * self.scale)))
+                x += 40
+            gate = at(center, (remaining, 0.0))
+            g = max(10, int(46 * self.scale))
+            pygame.draw.line(surf, TEAM_COLORS[BLUE]["hull"], (gate[0], gate[1] - g), (gate[0], gate[1] + g),
+                             max(2, int(3 * self.scale)))
+            for dy in (-g, g):
+                pygame.draw.circle(surf, TEAM_COLORS[BLUE]["glow"], (gate[0], gate[1] + dy), max(3, int(5 * self.scale)))
+            # Escort ring: blue ships inside it keep the convoy moving
+            rr = int(env.config.convoy_escort_radius * self.scale)
+            ring = (90, 150, 210) if convoy.moving else (150, 90, 90)
+            pygame.draw.circle(surf, ring, (int(center[0]), int(center[1])), rr, 1)
+
+    def _draw_base(self, surf, team, center):
+        import pygame
+        col = TEAM_COLORS[team]
+        r = int(self.env.config.flag_radius * self.scale)
+        c = (int(center[0]), int(center[1]))
+        pygame.draw.circle(surf, tuple(int(v * 0.35) for v in col["trail"]), c, int(r * 1.6))
+        pygame.draw.circle(surf, col["hull"], c, int(r * 1.6), max(1, int(2 * self.scale)))
+        pygame.draw.circle(surf, col["glow"], c, max(2, int(r * 0.25)))
+
+    def _draw_flag(self, surf, team, center, dropped=False, small=False):
+        import pygame
+        s = self.scale * (0.7 if small else 1.0)
+        col = TEAM_COLORS[team]["hull"]
+        if dropped and (self.env.frame // 10) % 2 == 0:
+            col = (255, 255, 255)  # blinking: it can be grabbed or returned
+        x, y = int(center[0]), int(center[1])
+        pole = int(30 * s)
+        pygame.draw.line(surf, (220, 225, 235), (x, y + pole // 3), (x, y - pole), max(1, int(2 * s)))
+        pygame.draw.polygon(surf, col, [(x, y - pole), (x + int(20 * s), y - pole + int(7 * s)),
+                                        (x, y - pole + int(14 * s))])
+
     def _draw_station(self, surf, station, center, at):
         """Octagonal hull, rotating ring, glowing core, shield bubble, and shield/hull bars."""
         import pygame
@@ -489,6 +555,8 @@ class Renderer:
         cx, cy = int(center[0]), int(center[1])
         R = station.radius
         col = TEAM_COLORS[station.team_id]
+        if isinstance(station, Convoy):
+            return self._draw_convoy(surf, station, center, at)
         octagon = [(math.cos(k * math.pi / 4 + math.pi / 8) * R, math.sin(k * math.pi / 4 + math.pi / 8) * R)
                    for k in range(8)]
         if not station.active:  # wreck
@@ -527,6 +595,46 @@ class Renderer:
             y = y0 + i * (bh + 2)
             pygame.draw.rect(surf, (30, 34, 48), (x0, y, bw, bh))
             pygame.draw.rect(surf, c, (x0, y, int(bw * f), bh))
+
+    def _draw_convoy(self, surf, convoy, center, at):
+        """A long freighter hull pointing +x, with engine glow while moving and the same bars."""
+        import pygame
+        s, R = self.scale, convoy.radius
+        col = TEAM_COLORS[BLUE]
+        cx, cy = int(center[0]), int(center[1])
+        hull = [(1.5 * R, 0), (0.9 * R, 0.55 * R), (-1.3 * R, 0.6 * R), (-1.5 * R, 0.3 * R),
+                (-1.5 * R, -0.3 * R), (-1.3 * R, -0.6 * R), (0.9 * R, -0.55 * R)]
+        if not convoy.active:
+            pygame.draw.polygon(surf, (44, 42, 52), [at(center, o) for o in hull])
+            return
+        if convoy.moving and self.effects:
+            flick = 0.7 + 0.6 * self.rng.random()
+            for dy in (-0.3 * R, 0.3 * R):
+                pygame.draw.polygon(surf, (255, int(160 + 70 * flick), 70),
+                                    [at(center, (-1.5 * R, dy - 6)), at(center, (-1.5 * R - 22 * flick, dy)),
+                                     at(center, (-1.5 * R, dy + 6))])
+        flash = self.effects and self.state.flash.get(("station", BLUE), 0) > 0
+        fill = (255, 255, 255) if flash else tuple(int(c * 0.6) for c in col["trail"])
+        pts = [at(center, o) for o in hull]
+        pygame.draw.polygon(surf, fill, pts)
+        pygame.draw.polygon(surf, col["hull"], pts, max(2, int(3 * s)))
+        for k in range(3):  # cargo pods
+            pygame.draw.rect(surf, col["glow"], (*at(center, (-0.9 * R + k * 0.7 * R, -0.25 * R)),
+                                                 max(3, int(0.45 * R * s)), max(3, int(0.5 * R * s))), 1)
+        frac = convoy.shield / max(1, convoy.max_shield)
+        if frac > 0:
+            rr = int((R * 1.6 + 6) * s)
+            bubble = pygame.Surface((2 * rr + 4, 2 * rr + 4), pygame.SRCALPHA)
+            pygame.draw.circle(bubble, (110, 220, 255, int(40 + 130 * frac)), (rr + 2, rr + 2), rr,
+                               max(1, int(2 * s)))
+            surf.blit(bubble, (cx - rr - 2, cy - rr - 2))
+        bw, bh = int(R * 2.8 * s), max(3, int(4 * s))
+        x0, y0 = cx - bw // 2, cy - int((R * 1.6 + 16) * s)
+        hull_frac = convoy.hull / max(1, convoy.max_hull)
+        for i, (f, c) in enumerate(((frac, (110, 220, 255)),
+                                    (hull_frac, (120, 230, 140) if hull_frac > 0.35 else (255, 120, 110)))):
+            pygame.draw.rect(surf, (30, 34, 48), (x0, y0 + i * (bh + 2), bw, bh))
+            pygame.draw.rect(surf, c, (x0, y0 + i * (bh + 2), int(bw * f), bh))
 
     def _draw_health_bar(self, surf, ship, center):
         """Segmented bar above the ship (at pixel ``center``): hull blocks plus shield blocks."""
@@ -596,6 +704,19 @@ class Renderer:
             lx = min(max(ex - label.get_width() / 2, 2), w - label.get_width() - 2)
             ly = min(max(ey - math.sin(ang) * 16 - 6, 2), h - label.get_height() - 2)
             surf.blit(label, (int(lx), int(ly)))
+        # Flags: small triangle markers at the edge, so the objective is always findable
+        for team, flag in self.env.flags.items():
+            if self._visible(flag.pos, cam, 20):
+                continue
+            dx, dy = self._wrapped_delta(cam, flag.pos)
+            px, py = dx * self.scale, dy * self.scale
+            if abs(px) < 1e-6 and abs(py) < 1e-6:
+                continue
+            t = min((cx - margin) / max(abs(px), 1e-6), (cy - margin) / max(abs(py), 1e-6))
+            ex, ey = int(cx + px * t), int(cy + py * t)
+            col = TEAM_COLORS[team]["hull"]
+            pygame.draw.line(surf, (220, 225, 235), (ex, ey + 6), (ex, ey - 12), 2)
+            pygame.draw.polygon(surf, col, [(ex, ey - 12), (ex + 11, ey - 8), (ex, ey - 4)])
         # Stations: square markers, so the objective is always findable
         for team, station in self.env.stations.items():
             if not station.active or self._visible(station.pos, cam, station.radius):
@@ -638,6 +759,11 @@ class Renderer:
             pygame.draw.circle(surf, col, mp(ship.pos), 3 if name == self.follow else 2)
             if name == self.follow:
                 pygame.draw.circle(surf, (255, 255, 255), mp(ship.pos), 5, 1)
+        for team, flag in env.flags.items():
+            x, y = mp(flag.base)
+            pygame.draw.circle(surf, TEAM_COLORS[team]["trail"], (x, y), 5, 1)
+            fx, fy = mp(flag.pos)
+            pygame.draw.polygon(surf, TEAM_COLORS[team]["hull"], [(fx, fy - 6), (fx + 6, fy - 3), (fx, fy)])
         for team, station in env.stations.items():
             half = max(3, int(station.radius * k))
             x, y = mp(station.pos)
@@ -738,6 +864,13 @@ class Renderer:
                            else "station lost")
         if env.mode == "deathmatch":
             extra = {team: f"kills {env.team_kills[team]}" for team in (RED, BLUE)}
+        elif env.mode == "ctf":
+            extra = {team: f"captures {env.captures[team]}/{env.config.captures_to_win}"
+                     for team in (RED, BLUE)}
+        elif env.mode == "escort":
+            c = env.convoy
+            extra = {RED: "attacking", BLUE: (f"convoy {env.convoy_progress:.0%}"
+                                              + ("" if c.moving or not c.active else " HALTED"))}
         surf.blit(self.font.render(f"RED {red}  {extra[RED]}", True,
                                    TEAM_COLORS[RED]["hull"]), (14, 12))
         label = self.font.render(f"{extra[BLUE]}  BLUE {blue}", True, TEAM_COLORS[BLUE]["hull"])

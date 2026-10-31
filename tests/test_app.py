@@ -341,7 +341,7 @@ def test_attract_mode_background_runs(tmp_path):
     pygame.quit()
 
 
-@pytest.mark.parametrize("mode", ["siege", "survival"])
+@pytest.mark.parametrize("mode", ["siege", "survival", "ctf", "escort"])
 def test_objective_modes_play_through_to_results(app, mode):
     setup = quick_watch(app, mode)
     setup.spec.controllers = {"blue_0": "heuristic_1.0", "red_0": "heuristic_1.0"}
@@ -350,10 +350,12 @@ def test_objective_modes_play_through_to_results(app, mode):
     results = app.screen
     assert results.summary["mode"] == mode
     texts = texts_on(results)
-    if mode == "survival":
+    expected = {"survival": None, "siege": "Station damage", "ctf": "Captures",
+                "escort": "Convoy damage"}[mode]
+    if expected is None:
         assert any(t.startswith("Survived") for t in texts)
     else:
-        assert "Station damage" in texts
+        assert expected in texts
 
 
 def test_eight_ships_per_team_use_two_columns(app):

@@ -37,7 +37,7 @@ Two refactors make this possible:
 ## Screens
 
 - **Main menu:** Play, Gallery, Settings, Quit. (Watch was removed: give your ship to an AI to spectate.)
-- **Match setup:** mode (deathmatch, sudden death, station siege, survival), arena size
+- **Match setup:** mode (deathmatch, sudden death, station siege, survival, capture the flag, escort), arena size
   (mini 600 / small 1200 / medium 2400 / large 4800), ships per team, spawns (combat modes), asteroid count, splitting, time limit, a controller per
   ship (you, a trained model, or a scripted bot), difficulty, camera. Defaults to you flying
   `blue_0` in a 2v2 deathmatch. Switching to an objective mode swaps trained agents for the

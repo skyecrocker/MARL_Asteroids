@@ -88,7 +88,11 @@ def heuristic_action(env, agent_name, rng, p: float = 1.0, danger_zone: float = 
         diff = _angle_diff(math.atan2(-tdy, -tdx), ego.angle)
         return np.array([1 if abs(diff) < 1.5 else 0, _steer(diff), 0])
 
-    if stations:
+    if getattr(env, "flags", None):
+        return _ctf_action(env, ego, agent_name)
+    if getattr(env, "convoy", None) is not None and ego.team_id == 1:
+        return _escort_action(env, ego, agent_name)
+    if stations:  # siege, and escort attackers (the convoy is blue's "station")
         return _siege_attack(env, ego, agent_name, stations)
 
     best, tgt = float("inf"), None
@@ -103,8 +107,97 @@ def heuristic_action(env, agent_name, rng, p: float = 1.0, danger_zone: float = 
     return np.array([1 if abs(diff) < 0.5 and best > 150 else 0, _steer(diff), 1 if abs(diff) < 0.2 else 0])
 
 
+# ------------------------------------------------------------- objective-mode helpers
+
+
+def _enemies(env, ego, agent_name):
+    return [(n, s) for n, s in env.ships.items()
+            if n != agent_name and s.active and s.team_id != ego.team_id]
+
+
+def _fight(env, ego, other):
+    """The deathmatch attack: turn to the target, close to 150 px, fire when lined up."""
+    dx, dy, d = env.wrapped_delta(ego.pos, other.pos)
+    diff = _angle_diff(math.atan2(dy, dx), ego.angle)
+    return np.array([1 if abs(diff) < 0.5 and d > 150 else 0, _steer(diff), 1 if abs(diff) < 0.2 else 0])
+
+
+def _go_to(env, ego, agent_name, pos, arrive=0.0):
+    """Fly to a point (``arrive`` px is close enough), taking any shot that lines up on the way."""
+    dx, dy, d = env.wrapped_delta(ego.pos, pos)
+    diff = _angle_diff(math.atan2(dy, dx), ego.angle)
+    thrust = 1 if abs(diff) < 0.6 and d > arrive else 0
+    reach = env.config.bullet_speed * env.config.bullet_lifespan * 0.8
+    shoot = 0
+    for _, other in _enemies(env, ego, agent_name):
+        ex, ey, ed = env.wrapped_delta(ego.pos, other.pos)
+        if ed < reach and abs(_angle_diff(math.atan2(ey, ex), ego.angle)) < 0.12:
+            shoot = 1
+            break
+    return np.array([thrust, _steer(diff) if d > arrive else 0, shoot])
+
+
+def _nearest_enemy(env, ego, agent_name, around=None, within=float("inf")):
+    """Closest enemy ship to ``around`` (default: me) within ``within`` px of it, or None."""
+    center = ego.pos if around is None else around
+    best, best_d = None, within
+    for _, other in _enemies(env, ego, agent_name):
+        d = env._wrapped_dist(center, other.pos)
+        if d < best_d:
+            best, best_d = other, d
+    return best
+
+
+def _ctf_action(env, ego, agent_name):
+    """Even-numbered ships run for the enemy flag, odd ones defend; anyone with the flag goes home,
+    and the team hunts whoever is carrying its own flag."""
+    team = ego.team_id
+    own, theirs = env.flags[team], env.flags[1 - team]
+    if theirs.carrier == agent_name:
+        return _go_to(env, ego, agent_name, own.base)
+    runner = int(agent_name.split("_")[1]) % 2 == 0
+    if own.carrier is not None:
+        thief = env.ships[own.carrier]
+        if not runner or env._wrapped_dist(ego.pos, thief.pos) < 350:
+            return _fight(env, ego, thief)
+    if own.drop_timer is not None and not runner:
+        return _go_to(env, ego, agent_name, own.pos)  # touch it to send it home
+    if runner:
+        if theirs.carrier is None:
+            return _go_to(env, ego, agent_name, theirs.pos)
+        carrier = env.ships[theirs.carrier]  # a teammate has it: cover them
+        threat = _nearest_enemy(env, ego, agent_name, around=carrier.pos, within=350)
+        if threat is not None:
+            return _fight(env, ego, threat)
+        return _go_to(env, ego, agent_name, carrier.pos, arrive=120)
+    raider = _nearest_enemy(env, ego, agent_name, around=own.base, within=500)
+    if raider is None:
+        raider = _nearest_enemy(env, ego, agent_name, within=300)
+    if raider is not None:
+        return _fight(env, ego, raider)
+    return _go_to(env, ego, agent_name, own.base, arrive=160)
+
+
+def _escort_action(env, ego, agent_name):
+    """Blue in escort: stay close enough to keep the convoy moving, fight what comes near it."""
+    convoy = env.convoy
+    team = env.team_agents[ego.team_id]
+    i, n = team.index(agent_name), len(team)
+    radius = env.config.convoy_escort_radius
+    # Station ahead of the convoy, spread across its path
+    post = ((convoy.pos[0] + 140.0) % env.width,
+            (convoy.pos[1] + (i - (n - 1) / 2) * 70.0) % env.height)
+    if env._wrapped_dist(ego.pos, convoy.pos) > radius * 0.75:
+        return _go_to(env, ego, agent_name, post)
+    threat = _nearest_enemy(env, ego, agent_name, around=convoy.pos, within=450)
+    if threat is not None:
+        return _fight(env, ego, threat)
+    return _go_to(env, ego, agent_name, post, arrive=60)
+
+
 # Siege target preference, as multipliers on distance (lower = more attractive):
 PUSH = 0.75         # the enemy station is a bit more attractive than an equally distant ship
+PUSH_CONVOY = 0.4   # escort attackers go for the convoy over all but the closest escorts
 DEFEND = 0.55       # enemies near our own station are the most urgent
 DEFEND_RADIUS = 420.0
 STANDOFF = 230.0    # px from the station surface: inside bullet range (~480), out of ramming range
@@ -126,7 +219,9 @@ def _siege_attack(env, ego, agent_name, stations):
     target_station = stations.get(enemy_team)
     if target_station is not None and target_station.active:
         dx, dy, d = env.wrapped_delta(ego.pos, target_station.pos)
-        options.append((d * PUSH, dx, dy, d, True, target_station.radius))
+        # Escort attackers live for the convoy: it is the only way to win before the clock
+        push = PUSH_CONVOY if getattr(env, "convoy", None) is target_station else PUSH
+        options.append((d * push, dx, dy, d, True, target_station.radius))
     if not options:
         return NOOP.copy()
     _, dx, dy, d, is_station, radius = min(options, key=lambda o: o[0])

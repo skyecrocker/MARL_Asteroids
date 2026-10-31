@@ -20,7 +20,7 @@ import numpy as np
 from pettingzoo.utils.env import ParallelEnv
 
 from .config import MODES, RESPAWN_MODES, GameConfig
-from .entities import Asteroid, Bullet, Ship, Station
+from .entities import Asteroid, Bullet, Convoy, Flag, Ship, Station
 
 RED, BLUE = 0, 1
 TEAM_NAMES = ("red", "blue")
@@ -71,6 +71,8 @@ class TeamAsteroidsEnv(ParallelEnv):
         # all-zero observation) until it returns, and everyone terminates together at game end.
         self.persistent_agents = self.mode in RESPAWN_MODES
         self.stations: Dict[int, Station] = {}
+        self.flags: Dict[int, Flag] = {}
+        self.convoy: Optional[Convoy] = None
 
         self.possible_agents = [f"red_{i}" for i in range(self.n_red)] + \
                                [f"blue_{i}" for i in range(self.m_blue)]
@@ -118,6 +120,9 @@ class TeamAsteroidsEnv(ParallelEnv):
         self.wave = 1
         self.waves_cleared = 0
         self._wave_timer: Optional[int] = None
+        self.captures = {RED: 0, BLUE: 0}        # capture the flag score
+        self.flag_log: List[Tuple[str, str, int]] = []  # (event, agent, flag team)
+        self._objective_winner: Optional[int] = None  # set when a mode objective decides the game
         self._cumulative_rewards = {a: 0.0 for a in self.possible_agents}
 
         self._spawn_stations()
@@ -181,17 +186,20 @@ class TeamAsteroidsEnv(ParallelEnv):
                 if destroyed:  # no station, no more respawns
                     for a in defenders:
                         self.ships[a].respawn_timer = None
-            self._tick_mode()
+            if self.mode == "escort" and self.convoy is not None and not self.convoy.active:
+                self._objective_winner = RED  # convoy destroyed
+            self._tick_mode(ind)
             if self.render_mode == "human":
                 self.render()
             if self.on_frame is not None:
                 self.on_frame()
-            if self._team_out(RED) or self._team_out(BLUE) or self._out_of_time():
+            if (self._team_out(RED) or self._team_out(BLUE) or self._out_of_time()
+                    or self._objective_winner is not None):
                 break
         self.decision_step += 1
 
         red_out, blue_out = self._team_out(RED), self._team_out(BLUE)
-        terminated = red_out or blue_out
+        terminated = red_out or blue_out or self._objective_winner is not None
         truncated = (not terminated) and self._out_of_time()
         self.game_over = terminated or truncated
 
@@ -214,7 +222,9 @@ class TeamAsteroidsEnv(ParallelEnv):
             for a in members:
                 rewards_all[a] = (1 - rcfg.team_spirit) * ind[a] + rcfg.team_spirit * mean
         if self.game_over:
-            if terminated and red_out and not blue_out:
+            if self._objective_winner is not None:
+                self.winner = self._objective_winner
+            elif terminated and red_out and not blue_out:
                 self.winner = BLUE
             elif terminated and blue_out and not red_out:
                 self.winner = RED
@@ -260,26 +270,65 @@ class TeamAsteroidsEnv(ParallelEnv):
     # --------------------------------------------------------------- spawning
 
     def _spawn_stations(self):
+        """Mode objects: siege stations, CTF flags at their bases, the escort convoy."""
         cfg = self.config
-        self.stations = {}
+        self.stations, self.flags, self.convoy = {}, {}, None
         if self.mode == "siege":
             for team, fx in ((RED, cfg.station_x[0]), (BLUE, cfg.station_x[1])):
                 self.stations[team] = Station(self.width * fx, self.height / 2, team, cfg)
+        elif self.mode == "ctf":
+            for team, fx in ((RED, cfg.station_x[0]), (BLUE, cfg.station_x[1])):
+                self.flags[team] = Flag(team, self.width * fx, self.height / 2)
+        elif self.mode == "escort":
+            # The convoy is blue's "station": it reuses station collisions, damage and shield regen
+            self.convoy = Convoy(self.width * cfg.convoy_start, self.height / 2, BLUE, cfg)
+            self.stations[BLUE] = self.convoy
 
-    def station_slot(self, agent: str) -> Tuple[float, float, float]:
-        """(x, y, heading) where a siege ship (re)spawns: fanned out in front of its station,
-        facing the enemy station."""
+    @property
+    def route_length(self) -> float:
+        return self.config.convoy_route * self.width
+
+    @property
+    def convoy_progress(self) -> float:
+        return 0.0 if self.convoy is None else min(1.0, self.convoy.distance / self.route_length)
+
+    def home(self, team: int) -> Optional[np.ndarray]:
+        """Where a team regroups and respawns: its station, flag base, or (escort, blue) convoy."""
+        if team in self.stations:
+            return self.stations[team].pos
+        if team in self.flags:
+            return self.flags[team].base
+        return None
+
+    def _home_slot(self, agent: str) -> Tuple[float, float, float]:
+        """(x, y, heading) fanned around the team's home, facing the enemy home."""
         team = self.team_of[agent]
-        st = self.stations[team]
-        enemy = self.stations[RED if team == BLUE else BLUE]
-        dx, dy, _ = self.wrapped_delta(st.pos, enemy.pos)
-        base = math.atan2(dy, dx)
+        center = self.home(team)
+        if team in self.stations:
+            r = self.stations[team].radius + self.config.ship_radius + 34.0
+        else:
+            r = self.config.flag_radius + self.config.ship_radius + 40.0
+        enemy = self.home(1 - team)
+        if enemy is not None:
+            dx, dy, _ = self.wrapped_delta(center, enemy)
+            base = math.atan2(dy, dx)
+        else:
+            base = 0.0  # escort convoy: travels toward +x
         n = len(self.team_agents[team])
         i = int(agent.split("_")[1])
         theta = base + (i - (n - 1) / 2) * 0.55
-        r = st.radius + self.config.ship_radius + 34.0
-        return ((st.pos[0] + math.cos(theta) * r) % self.width,
-                (st.pos[1] + math.sin(theta) * r) % self.height, base)
+        if self.mode == "escort":
+            theta += math.pi  # form up behind the convoy
+        return ((center[0] + math.cos(theta) * r) % self.width,
+                (center[1] + math.sin(theta) * r) % self.height, base)
+
+    def _respawn_point(self, agent: str) -> Tuple[float, float, float]:
+        team = self.team_of[agent]
+        if self.mode == "siege" or self.mode == "ctf" or (self.mode == "escort" and team == BLUE):
+            return self._home_slot(agent)
+        if self.mode == "escort":  # attackers come back away from the convoy and its guards
+            return self._far_spawn(away_from=BLUE)
+        return self._far_spawn(away_from=1 - team)  # deathmatch
 
     def _far_spawn(self, away_from: int = BLUE) -> Tuple[float, float, float]:
         """A point far from every living ship of team ``away_from``, facing the nearest one.
@@ -332,8 +381,8 @@ class TeamAsteroidsEnv(ParallelEnv):
             bp = spawns[idx] if idx < len(spawns) else None
             fire_rate = bp.fire_rate if bp else None
 
-            if self.mode == "siege":
-                x, y, heading = self.station_slot(agent)
+            if self.mode in ("siege", "ctf") or (self.mode == "escort" and team == BLUE):
+                x, y, heading = self._home_slot(agent)
                 ship = Ship(x, y, team, agent, cfg, fire_rate=fire_rate)
                 ship.angle = heading
                 ship.protection = cfg.spawn_protection
@@ -366,6 +415,14 @@ class TeamAsteroidsEnv(ParallelEnv):
             self.ships[agent] = ship
         if self.mode == "survival":
             self._spawn_wave(1)  # needs blue placed first, to spawn red far away from it
+        if self.mode == "escort":  # attackers start well away from the convoy
+            for agent in self.team_agents[RED]:
+                x, y, heading = self._far_spawn(away_from=BLUE)
+                ship = self.ships[agent]
+                ship.pos[:] = (x, y)
+                ship.vel[:] = 0.0
+                ship.angle = heading
+                ship.protection = cfg.spawn_protection
 
     def _spawn_asteroids(self):
         cfg, rng = self.config, self.np_random
@@ -404,9 +461,10 @@ class TeamAsteroidsEnv(ParallelEnv):
         if thrust == 1:
             ship.vel[0] += math.cos(ship.angle) * cfg.thrust_power
             ship.vel[1] += math.sin(ship.angle) * cfg.thrust_power
-            speed = math.hypot(ship.vel[0], ship.vel[1])
-            if speed > cfg.max_speed:
-                ship.vel *= cfg.max_speed / speed
+        cap = cfg.max_speed * (cfg.flag_carrier_speed if self.carrying(agent_name) else 1.0)
+        speed = math.hypot(ship.vel[0], ship.vel[1])
+        if speed > cap:
+            ship.vel *= cap / speed
 
         if shoot == 1 and ship.cooldown <= 0:
             c, s = math.cos(ship.angle), math.sin(ship.angle)
@@ -635,22 +693,102 @@ class TeamAsteroidsEnv(ParallelEnv):
                                              for a in self.team_agents[team])
         if self.mode == "survival" and team == RED:
             return False  # red is the endless enemy: clearing a wave just brings the next one
-        if self.mode == "deathmatch":
-            return False  # everyone respawns: only the clock ends a deathmatch
+        if self.mode in ("deathmatch", "ctf", "escort"):
+            return False  # everyone respawns: the objective or the clock ends these
         return True
 
     def _schedule_respawn(self, agent: str):
         ship = self.ships[agent]
-        if (self.mode == "deathmatch"
+        if (self.mode in ("deathmatch", "ctf", "escort")
                 or (self.mode == "siege" and self.stations[self.team_of[agent]].active)):
             ship.respawn_timer = self.config.respawn_delay
 
-    def _tick_mode(self):
-        """Per-frame rules for respawning modes: station regen, respawn countdowns, waves."""
+    def carrying(self, agent: str) -> Optional[int]:
+        """Team of the flag this ship carries, or None."""
+        for team, flag in self.flags.items():
+            if flag.carrier == agent:
+                return team
+        return None
+
+    def _tick_flags(self, ind):
+        cfg, rc = self.config, self.config.rewards
+        r2 = cfg.flag_radius + cfg.ship_radius
+        for team, flag in self.flags.items():
+            enemy = 1 - team
+            if flag.carrier is not None:
+                carrier = self.ships[flag.carrier]
+                if not carrier.active:  # carrier destroyed: the flag drops where it fell
+                    self.flag_log.append(("drop", flag.carrier, team))
+                    flag.pos[:] = carrier.pos  # where it was destroyed
+                    flag.carrier = None
+                    flag.drop_timer = cfg.flag_return_time
+                    continue
+                flag.pos[:] = carrier.pos
+                if self._wrapped_dist(carrier.pos, self.flags[enemy].base) < r2:
+                    self.captures[enemy] += 1
+                    self.flag_log.append(("capture", flag.carrier, team))
+                    ind[flag.carrier] += rc.flag_capture
+                    flag.go_home()
+                    if self.captures[enemy] >= cfg.captures_to_win:
+                        self._objective_winner = enemy
+                continue
+            if flag.drop_timer is not None:
+                flag.drop_timer -= 1
+                if flag.drop_timer <= 0:
+                    self.flag_log.append(("return", "timeout", team))
+                    flag.go_home()
+                    continue
+                for a in self.team_agents[team]:  # owners touching it send it home
+                    s = self.ships[a]
+                    if s.active and self._wrapped_dist(s.pos, flag.pos) < r2:
+                        self.flag_log.append(("return", a, team))
+                        ind[a] += rc.flag_return
+                        flag.go_home()
+                        break
+                if flag.drop_timer is None:
+                    continue
+            for a in self.team_agents[enemy]:  # an enemy touching it takes it
+                s = self.ships[a]
+                if s.active and self.carrying(a) is None and \
+                        self._wrapped_dist(s.pos, flag.pos) < r2:
+                    flag.carrier, flag.drop_timer = a, None
+                    flag.pos[:] = s.pos
+                    self.flag_log.append(("pickup", a, team))
+                    ind[a] += rc.flag_pickup
+                    break
+
+    def _tick_convoy(self):
+        cfg, convoy = self.config, self.convoy
+        if convoy is None or not convoy.active:
+            return
+        r = cfg.convoy_escort_radius
+        convoy.moving = any(s.active and self._wrapped_dist(s.pos, convoy.pos) < r
+                            for a, s in self.ships.items() if self.team_of[a] == BLUE)
+        if convoy.moving:
+            step = min(cfg.convoy_speed, self.route_length - convoy.distance)
+            convoy.pos[0] = (convoy.pos[0] + step) % self.width
+            convoy.distance += step
+            if convoy.distance >= self.route_length - 1e-9:
+                self._objective_winner = BLUE
+
+    @property
+    def convoy_destination(self) -> Optional[np.ndarray]:
+        if self.convoy is None:
+            return None
+        x = (self.width * self.config.convoy_start + self.route_length) % self.width
+        return np.array([x, self.height / 2])
+
+    def _tick_mode(self, ind=None):
+        """Per-frame rules for respawning modes: station regen, respawns, waves, flags, convoy."""
         cfg = self.config
+        ind = ind if ind is not None else {a: 0.0 for a in self.possible_agents}
         for st in self.stations.values():
             st.tick()
-        if self.mode in ("siege", "deathmatch"):
+        if self.flags:
+            self._tick_flags(ind)
+        if self.convoy is not None:
+            self._tick_convoy()
+        if self.mode in ("siege", "deathmatch", "ctf", "escort"):
             for agent, ship in self.ships.items():
                 if ship.active:
                     continue
@@ -662,10 +800,7 @@ class TeamAsteroidsEnv(ParallelEnv):
                         continue
                 ship.respawn_timer -= 1
                 if ship.respawn_timer <= 0:
-                    if self.mode == "siege":
-                        x, y, heading = self.station_slot(agent)
-                    else:  # deathmatch: somewhere safe, away from the enemy team
-                        x, y, heading = self._far_spawn(away_from=1 - self.team_of[agent])
+                    x, y, heading = self._respawn_point(agent)
                     ship.respawn(x, y, heading, protection=cfg.spawn_protection)
         elif self.mode == "survival":
             if self._wave_timer is None:
@@ -713,6 +848,13 @@ class TeamAsteroidsEnv(ParallelEnv):
             out["wave"] = self.wave
         elif self.mode == "deathmatch":
             out["kills"] = dict(self.team_kills)
+        elif self.mode == "ctf":
+            out["captures"] = dict(self.captures)
+        elif self.mode == "escort":
+            out["progress"] = self.convoy_progress
+            out["convoy"] = {"hp": self.convoy.hp, "max_hp": self.convoy.max_hp,
+                             "alive": self.convoy.active}
+            out["station_damage"] = dict(self.station_damage)
         return out
 
     def _timeout_winner(self) -> int:
@@ -724,6 +866,11 @@ class TeamAsteroidsEnv(ParallelEnv):
         if self.mode == "deathmatch":
             r, b = self.team_kills[RED], self.team_kills[BLUE]
             return RED if r > b else (BLUE if b > r else -1)
+        if self.mode == "ctf":
+            r, b = self.captures[RED], self.captures[BLUE]
+            return RED if r > b else (BLUE if b > r else -1)
+        if self.mode == "escort":
+            return RED  # the attackers held the convoy up
         if self.mode == "survival":
             return BLUE
         if self.mode == "siege":

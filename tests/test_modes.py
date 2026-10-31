@@ -48,7 +48,7 @@ def play(env, blue="heuristic_1.0", red="heuristic_1.0", max_steps=20000):
 
 def test_make_game_sizes_and_defaults():
     for arena, size in ARENA_SIZES.items():
-        for mode in ("deathmatch", "sudden_death", "siege", "survival"):
+        for mode in ("deathmatch", "sudden_death", "siege", "survival", "ctf", "escort"):
             cfg = make_game(mode, arena, 2, 3)
             assert (cfg.width, cfg.height) == (size, size)
             assert cfg.num_asteroids == ARENA_ASTEROIDS[arena]
@@ -79,7 +79,7 @@ def test_fixed_deathmatch_spawns_face_off_and_random_spawns_vary():
     assert not np.allclose(r1.ships["red_0"].pos, r2.ships["red_0"].pos)
 
 
-@pytest.mark.parametrize("mode", ["deathmatch", "sudden_death", "siege", "survival"])
+@pytest.mark.parametrize("mode", ["deathmatch", "sudden_death", "siege", "survival", "ctf", "escort"])
 def test_observation_size_is_unchanged_so_trained_agents_load(mode):
     env = env_for(mode)
     assert obs_dim(env.config) == 221
@@ -346,7 +346,7 @@ def test_survival_timeout_is_a_blue_win():
     assert env.game_over and env.winner == BLUE
 
 
-@pytest.mark.parametrize("mode", ["deathmatch", "siege", "survival"])
+@pytest.mark.parametrize("mode", ["deathmatch", "siege", "survival", "ctf", "escort"])
 def test_respawning_modes_keep_every_agent_until_the_end(mode):
     env = env_for(mode, max_frames=40)
     everyone = list(env.agents)
@@ -529,7 +529,7 @@ def test_survival_waves_keep_growing_in_the_app():
     assert sum(env.ships[a].active for a in env.team_agents[RED]) == SURVIVAL_MAX_ENEMIES
 
 
-@pytest.mark.parametrize("mode", ["deathmatch", "sudden_death", "siege", "survival"])
+@pytest.mark.parametrize("mode", ["deathmatch", "sudden_death", "siege", "survival", "ctf", "escort"])
 @pytest.mark.parametrize("arena", ["mini", "large"])
 def test_eight_ships_per_team_fit_every_mode_and_arena(mode, arena):
     env = TeamAsteroidsEnv(make_game(mode, arena, 8, 8))
@@ -540,3 +540,187 @@ def test_eight_ships_per_team_fit_every_mode_and_arena(mode, arena):
         for b in blues[i + 1:]:
             assert env._wrapped_dist(a.pos, b.pos) > 2 * a.radius
     idle(env, 3)
+
+
+# ------------------------------------------------------------------------ capture the flag
+
+
+def ctf_env(**overrides):
+    env = env_for("ctf", arena="small", **overrides)
+    for s in env.ships.values():
+        s.protection = 0
+    return env
+
+
+def touch(env, agent, pos):
+    park(env, agent, pos[0], pos[1])
+    idle(env)
+
+
+def test_ctf_bases_and_spawns():
+    env = ctf_env()
+    red, blue = env.flags[RED], env.flags[BLUE]
+    assert red.at_base and blue.at_base
+    _, _, d = env.wrapped_delta(red.base, blue.base)
+    assert d == pytest.approx(env.width / 2)
+    for agent, ship in env.ships.items():  # everyone starts at their own base
+        assert env._wrapped_dist(ship.pos, env.flags[ship.team_id].base) < 120
+
+
+def test_ctf_pickup_slows_the_carrier_and_capture_scores():
+    env = ctf_env()
+    rc = env.config.rewards
+    touch(env, "red_0", env.flags[BLUE].base)
+    assert env.flags[BLUE].carrier == "red_0" and env.carrying("red_0") == BLUE
+    ship = env.ships["red_0"]
+    ship.vel[:] = (env.config.max_speed, 0.0)
+    env.step({"red_0": [1, 0, 0], **{a: [0, 0, 0] for a in env.agents if a != "red_0"}})
+    assert np.hypot(*ship.vel) <= env.config.max_speed * env.config.flag_carrier_speed + 1e-9
+    touch(env, "red_0", env.flags[RED].base)
+    assert env.captures == {RED: 1, BLUE: 0} and env.flags[BLUE].at_base
+    assert ("capture", "red_0", BLUE) in env.flag_log
+    assert rc.flag_capture > 0
+
+
+def test_ctf_dropped_flag_returns_by_touch_or_timer_and_can_be_retaken():
+    env = ctf_env()
+    flag = env.flags[BLUE]
+    touch(env, "red_0", flag.base)
+    park(env, "red_0", 100, 100)
+    env.ships["red_0"].apply_damage(99)
+    idle(env)
+    assert flag.carrier is None and flag.drop_timer is not None
+    np.testing.assert_allclose(flag.pos, (100, 100), atol=5)
+    touch(env, "red_1", flag.pos)                 # an enemy picks it back up
+    assert flag.carrier == "red_1"
+    park(env, "red_1", 300, 300)
+    env.ships["red_1"].apply_damage(99)
+    idle(env)
+    touch(env, "blue_0", flag.pos)                # its owner sends it home
+    assert flag.at_base
+    # and a flag nobody touches goes home on its own
+    touch(env, "blue_1", env.flags[RED].base)
+    park(env, "blue_1", 500, 500)
+    env.ships["blue_1"].apply_damage(99)
+    idle(env)
+    assert env.flags[RED].drop_timer is not None
+    idle(env, env.config.flag_return_time // env.config.action_repeat + 1)
+    assert env.flags[RED].at_base
+
+
+def test_ctf_first_to_three_wins():
+    env = ctf_env()
+    for _ in range(env.config.captures_to_win):
+        touch(env, "blue_0", env.flags[RED].base)
+        touch(env, "blue_0", env.flags[BLUE].base)
+    assert env.game_over and env.winner == BLUE
+    assert env.summary() == {"mode": "ctf", "captures": {RED: 0, BLUE: 3}}
+
+
+def test_ctf_timeout_most_captures_wins_and_level_draws():
+    env = ctf_env(max_frames=60 * 5)
+    touch(env, "red_0", env.flags[BLUE].base)
+    touch(env, "red_0", env.flags[RED].base)
+    while env.agents:
+        idle(env)
+    assert env.winner == RED
+    env = ctf_env(max_frames=4)
+    idle(env, 2)
+    assert env.winner == -1
+
+
+def test_ctf_ships_respawn_at_their_base():
+    env = ctf_env()
+    env.ships["blue_0"].apply_damage(99)
+    idle(env, env.config.respawn_delay // env.config.action_repeat + 2)
+    ship = env.ships["blue_0"]
+    assert ship.active and env._wrapped_dist(ship.pos, env.flags[BLUE].base) < 120
+
+
+def test_bots_capture_flags():
+    env = env_for("ctf", arena="small", max_frames=60 * 120)
+    play(env)
+    assert sum(env.captures.values()) >= 1
+
+
+# --------------------------------------------------------------------------------- escort
+
+
+def escort_env(**overrides):
+    env = env_for("escort", arena="small", **overrides)
+    for s in env.ships.values():
+        s.protection = 0
+    return env
+
+
+def test_convoy_moves_only_while_escorted():
+    env = escort_env()
+    convoy = env.convoy
+    for a in env.team_agents[BLUE]:
+        park(env, a, convoy.pos[0], convoy.pos[1] + 100)
+    x0 = convoy.pos[0]
+    idle(env, 5)
+    assert convoy.pos[0] > x0 and convoy.moving
+    for a in env.team_agents[BLUE]:  # escorts leave: it halts
+        park(env, a, (convoy.pos[0] + env.width / 2) % env.width, convoy.pos[1])
+    x1 = convoy.pos[0]
+    idle(env, 5)
+    assert convoy.pos[0] == pytest.approx(x1) and not convoy.moving
+
+
+def test_convoy_arrival_wins_for_blue():
+    env = escort_env()
+    env.convoy.distance = env.route_length - 0.1
+    for a in env.team_agents[BLUE]:
+        park(env, a, env.convoy.pos[0], env.convoy.pos[1] + 100)
+    idle(env)
+    assert env.game_over and env.winner == BLUE and env.convoy_progress == 1.0
+
+
+def test_destroying_the_convoy_wins_for_red_and_blue_fire_passes_through():
+    env = escort_env()
+    c = env.convoy
+    env.bullets = [Bullet(c.pos[0] - c.radius - 1, c.pos[1], 3.0, 0.0, "blue_0", BLUE, env.config)]
+    env._resolve_collisions()
+    assert c.hp == c.max_hp
+    c.apply_damage(c.hp - 1)
+    env.bullets = [Bullet(c.pos[0] - c.radius - 1, c.pos[1], 3.0, 0.0, "red_0", RED, env.config)]
+    idle(env)
+    assert not c.active and env.game_over and env.winner == RED
+
+
+def test_escort_timeout_goes_to_red():
+    env = escort_env(max_frames=4)
+    idle(env, 2)
+    assert env.winner == RED
+
+
+def test_escort_respawns_blue_at_the_convoy_and_red_away_from_it():
+    env = escort_env()
+    for agent in ("blue_0", "red_0"):
+        env.ships[agent].apply_damage(99)
+    idle(env, env.config.respawn_delay // env.config.action_repeat + 2)
+    blue, red = env.ships["blue_0"], env.ships["red_0"]
+    assert blue.active and env._wrapped_dist(blue.pos, env.convoy.pos) < 150
+    assert red.active and env._wrapped_dist(red.pos, env.convoy.pos) > 200
+
+
+def test_bots_play_escort_both_ways():
+    env = env_for("escort", arena="small", max_frames=60 * 90)
+    play(env)
+    assert env.game_over and env.convoy_progress > 0.3 and env.station_damage[RED] > 0
+
+
+@pytest.mark.parametrize("mode", ["ctf", "escort"])
+@pytest.mark.parametrize("follow", [None, "blue_0"])
+def test_new_modes_render(mode, follow):
+    from marl_asteroids.render import Renderer
+    env = env_for(mode, arena="small")
+    r = Renderer(env, window=300, follow=follow)
+    p = make_scripted("heuristic_1.0", 0)
+    for _ in range(120):
+        if not env.agents:
+            break
+        ags = list(env.agents)
+        env.step(dict(zip(ags, p.act(None, [(env, a) for a in ags]))))
+        r.render("surface")

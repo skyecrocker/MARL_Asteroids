@@ -25,7 +25,7 @@ ARENA_OPTIONS = [(f"{name.capitalize()} ({size:.0f})", name) for name, size in A
 SPAWN_OPTIONS = [("Fixed (facing off)", True), ("Random", False)]
 BOT = "heuristic_1.0"  # default AI in modes the trained agents haven't learned
 # Modes with an objective the trained agents can't see; fighting modes use them as-is
-OBJECTIVE_MODES = ("siege", "survival")
+OBJECTIVE_MODES = ("siege", "survival", "ctf", "escort")
 COMBAT_MODES = ("deathmatch", "sudden_death")
 
 SCRIPTED = [
@@ -669,6 +669,30 @@ class GameScreen(MenuScreen):
                 pygame.draw.rect(surface, (30, 34, 48), (rect.x, y + 22 + i * 8, bw, 5))
                 pygame.draw.rect(surface, c, (rect.x, y + 22 + i * 8, int(bw * f), 5))
             y += 52
+        if env.mode == "ctf":
+            n, goal = env.captures[team], env.config.captures_to_win
+            surface.blit(self.font_big.render(f"{n}/{goal} captures", True, col), (rect.x, y))
+            flag = env.flags[team]
+            where = ("at base" if flag.at_base else
+                     f"taken by {ship_label(flag.carrier)}" if flag.carrier else
+                     f"dropped, home in {flag.drop_timer / 60:.0f}s")
+            surface.blit(self.font.render(f"Flag {where}", True, (150, 160, 182)), (rect.x, y + 28))
+            y += 56
+        if env.mode == "escort":
+            if team == BLUE:
+                c = env.convoy
+                label = (f"Convoy {env.convoy_progress:.0%}" + ("" if c.moving else "  halted")
+                         if c.active else "Convoy destroyed")
+                surface.blit(self.font_big.render(label, True, col), (rect.x, y))
+                bw = min(rect.width, 160)
+                for i, (f, cc) in enumerate(((env.convoy_progress, (200, 210, 235)),
+                                             (c.hp / max(1, c.max_hp), (120, 230, 140)))):
+                    pygame.draw.rect(surface, (30, 34, 48), (rect.x, y + 30 + i * 8, bw, 5))
+                    pygame.draw.rect(surface, cc, (rect.x, y + 30 + i * 8, int(bw * f), 5))
+                y += 52
+            else:
+                surface.blit(self.font_big.render("Stop the convoy", True, col), (rect.x, y))
+                y += 34
         if env.mode == "deathmatch":  # the score
             n = env.team_kills[team]
             surface.blit(self.font_big.render(f"{n} kill{'s' if n != 1 else ''}", True, col),
@@ -753,6 +777,10 @@ class ResultsScreen(MenuScreen):
             rows.insert(1, ("Station damage", "station_damage"))
         if mode == "deathmatch":  # the score counts every enemy death, not just your shots
             rows.insert(0, ("Score", "score"))
+        if mode == "ctf":
+            rows.insert(0, ("Captures", "captures"))
+        if mode == "escort":
+            rows.insert(1, ("Convoy damage", "station_damage"))
         # Card hugs the content: title, subtitle, header row, stat rows, buttons
         self.card((x - 30, y - 20, cw + 60, 20 + 118 + 30 * len(rows) + 56 + 46 + 30))
         if mode == "survival":
@@ -767,7 +795,10 @@ class ResultsScreen(MenuScreen):
         self.label((x, y - 6, cw, 80), title, "#title")
         how = self._how()
         # Deathmatch always runs to the clock, so its duration says nothing; the score does
-        sub = how if mode == "deathmatch" else f"{how} after {self.frames / PHYSICS_FPS:.1f} s"
+        limit = self.match.config.max_frames
+        timed_out = limit is not None and self.frames >= limit
+        # A game that ran to the clock: its duration says nothing, the score does
+        sub = how if mode == "deathmatch" or timed_out else f"{how} after {self.frames / PHYSICS_FPS:.1f} s"
         self.label((x, y + 70, cw, 28), sub, "#subtitle")
 
         # Stats as a label grid: name column left-aligned, numbers right-aligned under each team
@@ -779,7 +810,10 @@ class ResultsScreen(MenuScreen):
         self.label((tx + name_w + num_w + pad, ty, num_w, 26), "Red", "#red_head")
         for name, key in rows:
             ty += 30
-            if key == "score":
+            if key == "captures":
+                caps = self.summary.get("captures", {})
+                d = {"blue": caps.get(BLUE, 0), "red": caps.get(RED, 0)}
+            elif key == "score":
                 score = self.summary.get("kills", {})
                 d = {"blue": score.get(BLUE, 0), "red": score.get(RED, 0)}
             elif key == "station_damage":
@@ -801,6 +835,20 @@ class ResultsScreen(MenuScreen):
         cfg = self.match.config
         mode = self.summary.get("mode", "sudden_death")
         timed_out = cfg.max_frames is not None and self.frames >= cfg.max_frames
+        if mode == "ctf":
+            caps = self.summary.get("captures", {})
+            b, r = caps.get(BLUE, 0), caps.get(RED, 0)
+            if timed_out:
+                return (f"Level on captures when time ran out: {b} to {r}" if self.winner == -1
+                        else f"Most captures when time ran out: {max(b, r)} to {min(b, r)}")
+            return f"Reached {cfg.captures_to_win} captures, {max(b, r)} to {min(b, r)}"
+        if mode == "escort":
+            pct = self.summary.get("progress", 0.0)
+            if self.winner == BLUE:
+                return "Convoy delivered"
+            if timed_out:
+                return f"Convoy stopped short at {pct:.0%} when time ran out"
+            return f"Convoy destroyed at {pct:.0%} of the route"
         if mode == "deathmatch":
             kills = self.summary.get("kills", {})
             b, r = kills.get(BLUE, 0), kills.get(RED, 0)

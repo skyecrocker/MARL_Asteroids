@@ -146,6 +146,39 @@ class Station(Entity):
             self.shield += 1
 
 
+class Convoy(Station):
+    """Escort: a slow, unarmed ship with a station's shield, driven along a fixed route."""
+
+    def __init__(self, x, y, team_id: int, config: GameConfig):
+        super().__init__(x, y, team_id, config)
+        self.radius = float(config.convoy_radius)
+        self.max_hull = self.hull = int(config.convoy_hull)
+        self.max_shield = self.shield = int(config.convoy_shield)
+        self.regen_per_frame = float(config.convoy_shield_regen) / 60.0
+        self.distance = 0.0   # px travelled along the route
+        self.moving = False   # escorted this frame (for the HUD)
+
+
+class Flag:
+    """Capture the flag: one per team. Lives at its base, on a carrier, or dropped in space."""
+
+    def __init__(self, team_id: int, base_x: float, base_y: float):
+        self.team_id = team_id
+        self.base = np.array([base_x, base_y], dtype=np.float64)
+        self.pos = self.base.copy()
+        self.carrier = None       # agent name carrying it
+        self.drop_timer = None    # frames until a dropped flag returns home
+
+    @property
+    def at_base(self) -> bool:
+        return self.carrier is None and self.drop_timer is None
+
+    def go_home(self):
+        self.pos[:] = self.base
+        self.carrier = None
+        self.drop_timer = None
+
+
 class Asteroid(Entity):
     def __init__(self, x, y, vx, vy, config: GameConfig, size: int = 3):
         super().__init__(x, y, vx, vy, config.asteroid_radius(size))
