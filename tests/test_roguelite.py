@@ -68,6 +68,10 @@ def test_default_config_is_valid_and_uses_the_medium_arena():
     dict(elite_majority_from=9),                                       # band at 9 is only 25% elite
     dict(arena="enormous"),
     dict(catalog=DEFAULT_ROGUELITE.catalog + (UpgradeDef("player.hull", "x", "player", (), 1, 1),)),
+    dict(catalog=tuple(u for u in DEFAULT_ROGUELITE.catalog if u.id != "player.firepower")),
+    dict(catalog=tuple(u for u in DEFAULT_ROGUELITE.catalog if u.id != "wing.firepower")),
+    dict(asteroid_hp={1: 1, 2: 2, 3: 4}),                              # no hit points for size 4
+    dict(asteroid_hp={1: 1, 2: 2, 3: 4, 4: 0}),
 ])
 def test_validate_rejects_broken_tables(change):
     with pytest.raises(ValueError):
@@ -112,6 +116,32 @@ def test_fleet_caps_at_three_wingmen_and_intelligence_at_elite():
     rows = {r.id: r for r in shop_rows(s, CFG)}
     assert rows["wing.buy"].maxed and rows["wing.buy"].cost is None
     assert rows["wing.buy"].level_text == "3/3 owned" and rows["wing.tier"].level_text == "Elite"
+
+
+def test_rocks_are_indestructible_until_firepower_reaches_them():
+    game = make_roguelite_config(CFG)
+    assert game.breakable_asteroid_size == 0 and game.num_huge_asteroids == CFG.huge_asteroids
+    s = RunState.new(CFG, seed=0)
+    assert effective_stats(CFG, s, "player").break_size == 0
+    assert effective_stats(CFG, s, "player").bullet_damage == 1
+
+
+def test_firepower_ladder_reaches_the_largest_rock():
+    """Each firepower level adds one point of damage and one size tier, for the player and for
+    the wingmen separately."""
+    s = dataclasses.replace(RunState.new(CFG, seed=0), credits=10 ** 6)
+    top = CFG.item("player.firepower").max_level
+    assert top == 4
+    for level in range(1, top + 1):
+        s = buy(s, "player.firepower", CFG)
+        st = effective_stats(CFG, s, "player")
+        assert (st.break_size, st.bullet_damage) == (level, 1 + level)
+    assert can_buy(s, "player.firepower", CFG) == (False, "maxed")
+    wing = effective_stats(CFG, s, "wingmen")
+    assert wing.break_size == 0 and wing.bullet_damage == 1  # wingman firepower is separate
+    s = buy(s, "wing.buy", CFG)
+    s = buy(s, "wing.firepower", CFG)
+    assert effective_stats(CFG, s, "wingmen").break_size == 1
 
 
 def test_fire_rate_floor():

@@ -26,6 +26,11 @@ from .policies import HumanPolicy, Policy, ReactionDelayPolicy, ScriptedPolicy, 
 VARIANT_ORDER = ("standard", "scout", "heavy", "sniper")
 TIER_ORDER = ("basic", "veteran", "elite")
 WINGMAN = "wingman"  # the look/policy key wingmen use in place of an enemy variant
+# Rock sizes 1..4. Firepower level n breaks rocks up to size n, so the top firepower level reaches
+# the largest rock. Rocks are indestructible to a ship that can't break them.
+ROCK_TIERS = 4
+ROCK_HP = {1: 1, 2: 2, 3: 4, 4: 8}  # hits to break each size at the base damage of 1
+FIREPOWER_EFFECTS = (("bullet_damage", 1), ("break_size", 1))
 
 # ------------------------------------------------------------------------------- data
 
@@ -104,6 +109,8 @@ DEFAULT_CATALOG = (
     UpgradeDef("player.shield", "Shield", "player", (("max_shield", 1),), 50, 4, blurb="+1 shield"),
     UpgradeDef("player.fire_rate", "Fire rate", "player", (("fire_rate", -4),), 70, 5,
                floors=(("fire_rate", 12),), blurb="faster reload"),
+    UpgradeDef("player.firepower", "Firepower", "player", FIREPOWER_EFFECTS, 80, ROCK_TIERS,
+               blurb="+1 damage, breaks bigger rocks"),
     UpgradeDef("player.engine", "Engines", "player", ENGINE, 60, 4, blurb="more thrust and speed"),
     UpgradeDef("wing.buy", "Buy wingman", "wingmen", (), 120, 3, blurb="one more AI ship"),
     UpgradeDef("wing.tier", "Intelligence", "wingmen", (), 150, 2, blurb="smarter, faster bots"),
@@ -111,6 +118,8 @@ DEFAULT_CATALOG = (
     UpgradeDef("wing.shield", "Shield", "wingmen", (("max_shield", 1),), 70, 4, blurb="+1 shield"),
     UpgradeDef("wing.fire_rate", "Fire rate", "wingmen", (("fire_rate", -5),), 90, 5,
                floors=(("fire_rate", 15),), blurb="faster reload"),
+    UpgradeDef("wing.firepower", "Firepower", "wingmen", FIREPOWER_EFFECTS, 100, ROCK_TIERS,
+               blurb="+1 damage, breaks bigger rocks"),
     UpgradeDef("wing.engine", "Engines", "wingmen", ENGINE, 80, 4, blurb="more thrust and speed"),
 )
 
@@ -133,7 +142,9 @@ DEFAULT_SCHEDULE = (
 @dataclass(frozen=True)
 class RogueliteConfig:
     arena: str = "medium"
-    num_asteroids: int = 14
+    num_asteroids: int = 14          # large rocks (size 3) in the field
+    huge_asteroids: int = 4          # the largest rocks (size 4), placed at the start of a run
+    asteroid_hp: Dict[int, int] = field(default_factory=lambda: dict(ROCK_HP))
     start_credits: int = 60
     clear_bonus_base: int = 20
     clear_bonus_per_wave: int = 5
@@ -199,6 +210,15 @@ class RogueliteConfig:
         for u in self.catalog:
             if u.base_cost < 1 or u.max_level < 0 or u.target not in ("player", "wingmen"):
                 raise ValueError(f"bad shop item {u.id!r}")
+        if sorted(self.asteroid_hp) != list(range(1, ROCK_TIERS + 1)) or min(self.asteroid_hp.values()) < 1:
+            raise ValueError(f"asteroid_hp needs a positive entry for each size 1..{ROCK_TIERS}")
+        for item_id in ("player.firepower", "wing.firepower"):
+            if item_id not in ids:
+                raise ValueError(f"missing shop item {item_id!r}")
+            u = self.item(item_id)
+            reach = sum(delta for name, delta in u.effects if name == "break_size") * u.max_level
+            if reach < ROCK_TIERS:
+                raise ValueError(f"{item_id} must be able to break the largest rock")
         if "wing.buy" in ids and self.item("wing.buy").max_level != self.max_fleet - 1:
             raise ValueError("wing.buy max_level must be max_fleet - 1")
         if "wing.tier" in ids and self.item("wing.tier").max_level != len(self.tiers) - 1:
@@ -224,11 +244,14 @@ DEFAULT_ROGUELITE = RogueliteConfig()
 
 def make_roguelite_config(cfg: RogueliteConfig = DEFAULT_ROGUELITE) -> GameConfig:
     """The env config for a run: fixed arena, 4 blue and 20 red slots, no clock, no friendly fire
-    (your own shots would otherwise make wingmen a liability). Physics stay at the defaults."""
+    (your own shots would otherwise make wingmen a liability). Rocks are breakable only through
+    firepower, so ships start with ``breakable_asteroid_size=0``. Physics stay at the defaults."""
     size = ARENA_SIZES[cfg.arena]
     return GameConfig(mode=ROGUELITE_MODE, width=size, height=size, m_blue=cfg.max_fleet,
-                      n_red=cfg.max_enemies, num_asteroids=cfg.num_asteroids, asteroids_split=True,
-                      friendly_fire=False, max_frames=None, min_spawn_dist=max(150.0, size * 0.15))
+                      n_red=cfg.max_enemies, num_asteroids=cfg.num_asteroids,
+                      num_huge_asteroids=cfg.huge_asteroids, asteroid_hp=dict(cfg.asteroid_hp),
+                      breakable_asteroid_size=0, asteroids_split=True, friendly_fire=False,
+                      max_frames=None, min_spawn_dist=max(150.0, size * 0.15))
 
 
 # --------------------------------------------------------------------------- run state

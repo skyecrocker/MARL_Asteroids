@@ -446,21 +446,26 @@ class TeamAsteroidsEnv(ParallelEnv):
             vx, vy = rng.normal(bp.vx, bp.vx_noise), rng.normal(bp.vy, bp.vy_noise)
             self.asteroids.append(Asteroid(x, y, vx, vy, cfg, size=bp.size))
         for _ in range(max(0, cfg.num_asteroids - len(cfg.asteroid_spawns or []))):
-            self.asteroids.append(self._random_rock())
+            self.asteroids.append(self._random_rock(3))
+        for _ in range(cfg.num_huge_asteroids):
+            self.asteroids.append(self._random_rock(4))
 
-    def _random_rock(self) -> Asteroid:
-        """A large asteroid at a random spot clear of active ships and stations."""
+    def _random_rock(self, size: int = 3) -> Asteroid:
+        """An asteroid of ``size`` at a random spot clear of active ships and stations."""
         cfg, rng = self.config, self.np_random
+        # Bigger rocks need more room than the large tier, so they never spawn on top of a ship
+        extra = max(0.0, cfg.asteroid_radius(size) - cfg.asteroid_large_radius)
+        clear = cfg.asteroid_clear_radius + extra
         for _attempt in range(200):
             ax, ay = rng.uniform(0, self.width), rng.uniform(0, self.height)
-            if all(self._wrapped_dist((ax, ay), s.pos) >= cfg.asteroid_clear_radius
+            if all(self._wrapped_dist((ax, ay), s.pos) >= clear
                    for s in self.ships.values() if s.active) and \
-               all(self._wrapped_dist((ax, ay), st.pos) >= cfg.asteroid_clear_radius + st.radius
+               all(self._wrapped_dist((ax, ay), st.pos) >= clear + st.radius
                    for st in self.stations.values()):
                 break
         angle = rng.uniform(0, 2 * math.pi)
         speed = rng.uniform(*cfg.asteroid_speed_range)
-        return Asteroid(ax, ay, math.cos(angle) * speed, math.sin(angle) * speed, cfg, size=3)
+        return Asteroid(ax, ay, math.cos(angle) * speed, math.sin(angle) * speed, cfg, size=size)
 
     # ---------------------------------------------------------------- physics
 
@@ -493,7 +498,7 @@ class TeamAsteroidsEnv(ParallelEnv):
             bvx = ship.vel[0] + c * cfg.bullet_speed
             bvy = ship.vel[1] + s * cfg.bullet_speed
             self.bullets.append(Bullet(bx, by, bvx, bvy, agent_name, ship.team_id, cfg,
-                                       lifespan=ship.bullet_lifespan))
+                                       lifespan=ship.bullet_lifespan, damage=ship.bullet_damage))
             ship.cooldown = ship.fire_rate
 
     def _step_physics(self):
@@ -573,7 +578,7 @@ class TeamAsteroidsEnv(ParallelEnv):
                     continue
                 if self._wrapped_dist(b.pos, ship.pos) < b.radius + ship.radius:
                     b.active = False
-                    hit(b.owner_name, name, cfg.bullet_damage)
+                    hit(b.owner_name, name, b.damage)
                     break
 
         # Bullets vs stations: enemy fire damages a station; a team's own fire passes through it
@@ -586,7 +591,7 @@ class TeamAsteroidsEnv(ParallelEnv):
                         continue
                     if self._wrapped_dist(b.pos, st.pos) < b.radius + st.radius:
                         b.active = False
-                        dealt = st.apply_damage(cfg.bullet_damage)
+                        dealt = st.apply_damage(b.damage)
                         if dealt:
                             station_events.append((b.owner_name, team, dealt, not st.active))
                         break
@@ -600,18 +605,23 @@ class TeamAsteroidsEnv(ParallelEnv):
                     continue
                 if self._wrapped_dist(b.pos, ast.pos) < b.radius + ast.radius:
                     b.active = False
-                    if self.asteroids_split:
-                        ast.active = False
-                        if ast.size > 1:
-                            heading = math.atan2(ast.vel[1], ast.vel[0])
-                            speed = max(math.hypot(ast.vel[0], ast.vel[1]) * self.config.asteroid_split_speedup,
-                                        self.config.asteroid_split_min_speed)
-                            spread = self.config.asteroid_split_spread
-                            for off in (spread, -spread):
-                                new_asteroids.append(Asteroid(
-                                    ast.pos[0], ast.pos[1],
-                                    math.cos(heading + off) * speed, math.sin(heading + off) * speed,
-                                    self.config, size=ast.size - 1))
+                    shooter = self.ships.get(b.owner_name)
+                    # A rock takes damage only from a shooter whose firepower reaches its size.
+                    # For everyone else it is indestructible, and the shot is spent on it.
+                    if shooter is not None and self.asteroids_split and ast.size <= shooter.break_size:
+                        ast.hp -= b.damage
+                        if ast.hp <= 0:
+                            ast.active = False
+                            if ast.size > 1:
+                                heading = math.atan2(ast.vel[1], ast.vel[0])
+                                speed = max(math.hypot(ast.vel[0], ast.vel[1]) * self.config.asteroid_split_speedup,
+                                            self.config.asteroid_split_min_speed)
+                                spread = self.config.asteroid_split_spread
+                                for off in (spread, -spread):
+                                    new_asteroids.append(Asteroid(
+                                        ast.pos[0], ast.pos[1],
+                                        math.cos(heading + off) * speed, math.sin(heading + off) * speed,
+                                        self.config, size=ast.size - 1))
                     break
 
         # Ships vs asteroids: bounce off and take damage, gated by the collision cooldown so a
@@ -922,9 +932,11 @@ class TeamAsteroidsEnv(ParallelEnv):
     def _replenish_asteroids(self):
         """Roguelite: top the field back up to the configured number of large rocks between
         waves, so a long run doesn't end up in empty space once everything has been shot apart."""
-        large = sum(1 for a in self.asteroids if a.active and a.size == 3)
-        for _ in range(max(0, self.config.num_asteroids - large)):
-            self.asteroids.append(self._random_rock())
+        cfg = self.config
+        for size, want in ((3, cfg.num_asteroids), (4, cfg.num_huge_asteroids)):
+            have = sum(1 for a in self.asteroids if a.active and a.size == size)
+            for _ in range(max(0, want - have)):
+                self.asteroids.append(self._random_rock(size))
 
     def ship_stats(self, agent: str) -> Dict[str, float]:
         """A ship's stats as plain numbers (for HUDs, tests, and future observation features)."""

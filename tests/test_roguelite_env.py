@@ -9,12 +9,12 @@ from hypothesis import strategies as st
 
 from marl_asteroids.app.screens import MODE_OPTIONS
 from marl_asteroids.config import MODES, GameConfig, make_game
-from marl_asteroids.entities import Loadout, Ship, ShipStats
+from marl_asteroids.entities import Asteroid, Bullet, Loadout, Ship, ShipStats
 from marl_asteroids.env import BLUE, PLAYER, RED, TeamAsteroidsEnv, obs_dim
 from marl_asteroids.policies import NOOP, Policy, ReactionDelayPolicy, make_scripted
 from marl_asteroids.render import SHAPES, TEAM_COLORS, ship_look
 from marl_asteroids.roguelite import (DEFAULT_ROGUELITE, RogueliteRun, RunState, effective_stats,
-                                      wave_size, wingman_tier)
+                                      make_roguelite_config, wave_size, wingman_tier)
 
 CFG = DEFAULT_ROGUELITE
 WING_ITEMS = ["wing.tier", "wing.hull", "wing.shield", "wing.fire_rate", "wing.engine"]
@@ -60,6 +60,8 @@ def test_existing_modes_keep_config_stats_and_221_obs(mode):
     for ship in env.ships.values():
         assert ship.thrust_power == cfg.thrust_power and ship.max_speed == cfg.max_speed
         assert ship.bullet_lifespan == cfg.bullet_lifespan and ship.variant is None
+        # Existing modes break every rock size with one-damage shots, as they always have
+        assert ship.break_size == cfg.breakable_asteroid_size == 3 and ship.bullet_damage == 1
 
 
 def test_roguelite_is_not_a_setup_mode():
@@ -288,6 +290,91 @@ def test_every_look_is_distinct_and_team_colored():
         r, g, b = look.body
         assert b > r and b >= g
     assert player.shape == SHAPES["standard"] and player.body == TEAM_COLORS[BLUE]["hull"]
+
+
+# ---------------------------------------------------------------------------- asteroids
+
+
+def rock_env(break_size=0, damage=1):
+    """A roguelite env with the player's shots set to ``break_size`` and ``damage``. Only the player
+    is in play, so the only collisions are the ones each test sets up."""
+    env = TeamAsteroidsEnv(make_roguelite_config(CFG))
+    env.reset(seed=0)
+    ship = env.ships[PLAYER]
+    ship.apply_stats(dataclasses.replace(ship.stats, break_size=break_size, bullet_damage=damage))
+    return env
+
+
+def shoot(env, rock, shooter=PLAYER):
+    """One shot that hits ``rock`` dead centre, fired by ``shooter`` with its own damage."""
+    damage = env.ships[shooter].bullet_damage
+    env.bullets = [Bullet(rock.pos[0], rock.pos[1], 0.0, 0.0, shooter, BLUE, env.config,
+                          damage=damage)]
+    env._resolve_collisions()
+
+
+def place_rock(env, size):
+    rock = Asteroid(1800.0, 1200.0, 0.0, 0.0, env.config, size=size)
+    env.asteroids = [rock]
+    return rock
+
+
+def test_rock_tiers_and_hit_points():
+    game = make_roguelite_config(CFG)
+    assert game.asteroid_radius(4) > game.asteroid_radius(3) > game.asteroid_radius(2)
+    env = rock_env()
+    huge = [a for a in env.asteroids if a.size == 4]
+    assert len(huge) == CFG.huge_asteroids
+    assert all(a.hp == CFG.asteroid_hp[4] for a in huge)
+
+
+def test_rocks_are_indestructible_by_default():
+    env = rock_env(break_size=0, damage=5)
+    rock = place_rock(env, 4)
+    shoot(env, rock)
+    assert rock.active and rock.hp == CFG.asteroid_hp[4]
+    assert not env.bullets[0].active  # the shot is spent on it
+
+
+def test_firepower_breaks_rocks_up_to_its_size_only():
+    env = rock_env(break_size=2, damage=3)
+    small = place_rock(env, 2)                 # hp 2: one hit from damage 3 breaks it
+    shoot(env, small)
+    assert not small.active
+    assert sorted(a.size for a in env.asteroids) == [1, 1]  # two fragments, one tier down
+
+    env = rock_env(break_size=2, damage=3)
+    large = place_rock(env, 3)                 # size 3 is out of reach at firepower 2
+    shoot(env, large)
+    assert large.active and large.hp == CFG.asteroid_hp[3]
+
+
+def test_damage_accumulates_until_a_rock_breaks():
+    env = rock_env(break_size=4, damage=2)
+    rock = place_rock(env, 4)                  # hp 8, damage 2: four hits
+    for _ in range(3):
+        shoot(env, rock)
+        assert rock.active
+    shoot(env, rock)
+    assert not rock.active and rock.hp <= 0
+    assert sorted(a.size for a in env.asteroids) == [3, 3]
+
+
+def test_bullet_damage_comes_from_the_shooter():
+    env = rock_env(damage=3)
+    red = env.ships["red_0"]
+    red.respawn(1800.0, 1200.0, 0.0, protection=0)
+    env.bullets = [Bullet(red.pos[0], red.pos[1], 0.0, 0.0, PLAYER, BLUE, env.config, damage=3)]
+    env._resolve_collisions()
+    assert red.shield == 0 and red.hull == red.max_hull - 2  # 3 damage: shield 1, hull 2
+
+
+def test_roguelite_render_with_rocks_of_every_size():
+    pytest.importorskip("pygame")
+    env = TeamAsteroidsEnv(make_roguelite_config(CFG), render_mode="rgb_array")
+    env.reset(seed=2)
+    assert {a.size for a in env.asteroids} == {3, 4}
+    env.render()
 
 
 def test_roguelite_renders_every_variant_tier_and_wingman():

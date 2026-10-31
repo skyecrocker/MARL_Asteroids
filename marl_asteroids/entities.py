@@ -22,13 +22,17 @@ class ShipStats:
     thrust_power: float
     max_speed: float
     bullet_lifespan: int    # frames; bullet range is about bullet_speed * bullet_lifespan
+    bullet_damage: int = 1  # damage per hit on ships, stations, and rocks it can break
+    break_size: int = 0     # largest asteroid size this ship's shots can break (0 = none)
 
     @classmethod
     def from_config(cls, config: GameConfig, fire_rate: Optional[int] = None) -> "ShipStats":
         return cls(max_hull=int(config.max_hull), max_shield=int(config.max_shield),
                    fire_rate=int(fire_rate if fire_rate is not None else config.fire_rate),
                    thrust_power=float(config.thrust_power), max_speed=float(config.max_speed),
-                   bullet_lifespan=int(config.bullet_lifespan))
+                   bullet_lifespan=int(config.bullet_lifespan),
+                   bullet_damage=int(config.bullet_damage),
+                   break_size=int(config.breakable_asteroid_size))
 
     def as_dict(self) -> Dict[str, float]:
         return {k: (int(v) if isinstance(v, int) else float(v))
@@ -85,6 +89,8 @@ class Ship(Entity):
         self.thrust_power = float(stats.thrust_power)
         self.max_speed = float(stats.max_speed)
         self.bullet_lifespan = int(stats.bullet_lifespan)
+        self.bullet_damage = int(stats.bullet_damage)
+        self.break_size = int(stats.break_size)
         if refill:
             self.hull, self.shield = self.max_hull, self.max_shield
         else:
@@ -95,7 +101,8 @@ class Ship(Entity):
     def stats(self) -> ShipStats:
         return ShipStats(max_hull=self.max_hull, max_shield=self.max_shield,
                          fire_rate=self.fire_rate, thrust_power=self.thrust_power,
-                         max_speed=self.max_speed, bullet_lifespan=self.bullet_lifespan)
+                         max_speed=self.max_speed, bullet_lifespan=self.bullet_lifespan,
+                         bullet_damage=self.bullet_damage, break_size=self.break_size)
 
     def respawn(self, x, y, angle, protection: int = 0):
         """Bring a destroyed (or reserve) ship back at full health."""
@@ -243,13 +250,15 @@ class Asteroid(Entity):
     def __init__(self, x, y, vx, vy, config: GameConfig, size: int = 3):
         super().__init__(x, y, vx, vy, config.asteroid_radius(size))
         self.size = size
+        self.hp = int(config.asteroid_hp.get(size, 1))  # hits this rock takes to break
 
 
 class Bullet(Entity):
     def __init__(self, x, y, vx, vy, owner_name: str, team_id: int, config: GameConfig,
-                 lifespan: Optional[int] = None):
+                 lifespan: Optional[int] = None, damage: Optional[int] = None):
         super().__init__(x, y, vx, vy, config.bullet_radius)
         self.owner_name = owner_name
         self.team_id = team_id
         self.lifespan = int(lifespan if lifespan is not None else config.bullet_lifespan)
         self.max_lifespan = self.lifespan
+        self.damage = int(damage if damage is not None else config.bullet_damage)

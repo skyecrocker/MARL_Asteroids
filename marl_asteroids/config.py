@@ -114,6 +114,15 @@ class GameConfig:
     asteroid_large_radius: float = 30.0
     asteroid_medium_radius: float = 15.0
     asteroid_small_radius: float = 7.0
+    asteroid_huge_radius: float = 60.0  # the largest tier; only roguelite spawns it
+    # Hits a rock of each size takes to break. One hit at the defaults, so existing modes are
+    # unchanged. Roguelite sets higher values.
+    asteroid_hp: Dict[int, int] = field(default_factory=lambda: {1: 1, 2: 1, 3: 1, 4: 1})
+    num_huge_asteroids: int = 0
+    # Largest asteroid size a ship's shots can break. Existing modes break every size, which is
+    # what makes rocks split there. Roguelite ships start at 0 (rocks are cover) and firepower
+    # upgrades raise it.
+    breakable_asteroid_size: int = 3
     # When asteroids_split is True, a hit rock breaks into two smaller, faster fragments
     # (size 1 fragments are destroyed outright). When False, rocks are indestructible cover.
     asteroid_split_speedup: float = 1.4
@@ -208,7 +217,8 @@ class GameConfig:
     rewards: RewardConfig = field(default_factory=RewardConfig)
 
     def asteroid_radius(self, size: int) -> float:
-        return {3: self.asteroid_large_radius,
+        return {4: self.asteroid_huge_radius,
+                3: self.asteroid_large_radius,
                 2: self.asteroid_medium_radius,
                 1: self.asteroid_small_radius}[size]
 

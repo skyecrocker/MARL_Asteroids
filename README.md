@@ -63,6 +63,11 @@ is destroyed, even if wingmen survive; the score is the wave you reached. Each r
   rate, engines. *Wingmen*: buy up to 3 AI wingmen, then upgrade them as a group (intelligence, hull,
   shield, fire rate, engines). Each level costs 1.5x the last. Credits come from kills (tougher and
   smarter enemies pay more) plus a bonus per cleared wave.
+- **Asteroids** come in four sizes, from small fragments up to huge rocks. Rocks are indestructible
+  until you buy **Firepower** (for your ship, or separately for the wingmen). Each level adds one
+  point of damage per shot and lets your shots break one more size, up to the huge rocks. Shots
+  that can't break a rock are spent on it. Rocks hurt any ship they touch, so they're cover that
+  can become a hazard. Damage also applies to enemies, so Firepower is a combat upgrade too.
 - **Wingmen** respawn next to you at the start of every wave. Everyone starts each wave at full
   health. Friendly fire is off in this mode.
 - **Enemies** come in four types, told apart by silhouette: Standard, Scout (fast, fragile, forked
