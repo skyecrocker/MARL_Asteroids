@@ -148,3 +148,61 @@ def test_on_frame_stops_at_game_end():
     while env.agents:
         env.step({a: [0, 0, 0] for a in env.agents})
     assert calls == [1, 2, 3]  # last decision stops at the time limit mid-repeat
+
+
+# ------------------------------------------------------- wrap-around (torus seam) drawing
+
+
+def _seam_scene(follow):
+    """Small map, view >= map size, a rock straddling the top/bottom edge and a ship straddling
+    left/right. Renders 600x600 for an 800x800 map (scale 0.75)."""
+    import pygame
+    from marl_asteroids.config import EntityState, GameConfig
+    from marl_asteroids.render import ROCK_FILL, Renderer
+
+    cfg = GameConfig(n_red=1, m_blue=1, num_asteroids=1,
+                     asteroid_spawns=[EntityState(x=400.0, y=3.0)])
+    env = TeamAsteroidsEnv(cfg)
+    env.reset(seed=0)
+    env.asteroids[0].vel[:] = 0.0
+    env.ships["blue_0"].pos[:] = (400.0, 400.0)
+    env.ships["red_0"].pos[:] = (3.0, 600.0)
+    r = Renderer(env, window=600, follow=follow, view_size=1200.0, effects=False,
+                 show_hud=False, minimap=False)
+    pixels = pygame.surfarray.array3d(r.render("surface")).transpose(1, 0, 2)
+    rock = (pixels == np.array(ROCK_FILL)).all(-1)
+    return rock, pixels
+
+
+@pytest.mark.parametrize("follow", [None, "blue_0"])
+def test_shapes_crossing_the_map_edge_are_not_smeared(follow):
+    """Regression: vertices were projected (and wrapped) one by one, so a rock on the seam
+    stretched into a band across the whole screen."""
+    rock, _ = _seam_scene(follow)
+    rock_area = np.pi * (30 * 0.75) ** 2  # large asteroid radius 30, scale 0.75
+    assert rock.sum() < 1.5 * rock_area, "rock fill smeared across the screen"
+    # Drawn as two halves, one at each edge, instead of being clipped to one side
+    assert rock[:30].any() and rock[-30:].any()
+    assert not rock[200:400].any()
+
+
+@pytest.mark.parametrize("follow", [None, "blue_0"])
+def test_ship_crossing_the_map_edge_draws_on_both_sides(follow):
+    from marl_asteroids.render import TEAM_COLORS
+    _, pixels = _seam_scene(follow)
+    red = (pixels == np.array(TEAM_COLORS[0]["hull"])).all(-1)
+    cols = np.where(red.any(0))[0]
+    assert cols.size and cols.min() < 30 and cols.max() > 570  # both halves
+    assert red.sum() < 2000  # and not stretched across
+
+
+def test_large_map_follow_view_draws_one_copy():
+    """With a viewport smaller than the map, each object appears at most once."""
+    from marl_asteroids.render import Renderer
+    env = _env("team3_huge", follow="blue_0", view_size=1000.0, window=500)
+    env.render()
+    r = env.renderer
+    images = r._image_finder(r._projector(r._camera_center(), (500, 500), (0.0, 0.0)), (500, 500))
+    for rock in env.asteroids:
+        assert len(list(images(rock.pos, rock.radius))) <= 1
+    env.close()

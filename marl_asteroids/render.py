@@ -176,6 +176,29 @@ class Renderer:
                 return int(cx + dx * s + ox), int(cy + dy * s + oy)
         return to_px
 
+    def _image_finder(self, to_px, size):
+        """``images(pos, radius)`` -> pixel centers of every toroidal copy that overlaps the surface.
+
+        The map repeats every (width, height) world units, i.e. every period * scale pixels. When
+        the view spans (nearly) the whole map, an object crossing the edge must be drawn on both
+        sides at once, half on each, instead of popping across.
+        """
+        px_w, px_h = self.env.width * self.scale, self.env.height * self.scale
+        sw, sh = size
+
+        def images(pos, radius):
+            cx, cy = to_px(pos)
+            r = radius * self.scale + 2
+            for dx in (0.0, -px_w, px_w):
+                x = cx + dx
+                if x < -r or x > sw + r:
+                    continue
+                for dy in (0.0, -px_h, px_h):
+                    y = cy + dy
+                    if -r <= y <= sh + r:
+                        yield (x, y)
+        return images
+
     def _visible(self, pos, cam, margin=0.0):
         if self.follow is None:
             return True
@@ -294,6 +317,13 @@ class Renderer:
         size = surf.get_size()
         cam = self._camera_center()
         to_px = self._projector(cam, size, (ox, oy))
+        images = self._image_finder(to_px, size)
+
+        def at(center, offset):
+            """Pixel point ``offset`` world units from a projected center. Shapes are built from
+            offsets, never by projecting each vertex: per-vertex projection wraps vertices on
+            opposite sides of the seam independently and smears the shape across the screen."""
+            return int(center[0] + offset[0] * s), int(center[1] + offset[1] * s)
 
         if self.follow is None:
             surf.blit(self.bg, (int(ox * 0.3), int(oy * 0.3)))
@@ -327,19 +357,20 @@ class Renderer:
 
         # Asteroids
         for rock in env.asteroids:
-            if not rock.active or not self._visible(rock.pos, cam, rock.radius):
+            if not rock.active:
                 continue
             _, poly, spin, craters = self._rock_shape(rock)
             th = env.frame * spin
-            rot = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
-            pts = [to_px(rock.pos + p) for p in poly @ rot.T]
-            pygame.draw.polygon(surf, ROCK_FILL, pts)
-            for cx, cy, cr in craters:  # craters for texture, rotating with the rock
-                rx = cx * math.cos(th) - cy * math.sin(th)
-                ry = cx * math.sin(th) + cy * math.cos(th)
-                pygame.draw.circle(surf, (58, 55, 68), to_px((rock.pos[0] + rx, rock.pos[1] + ry)),
-                                   max(1, int(cr * s)))
-            pygame.draw.polygon(surf, ROCK_EDGE, pts, max(1, int(1.8 * s)))
+            c_, s_ = math.cos(th), math.sin(th)
+            rot = np.array([[c_, -s_], [s_, c_]])
+            offsets = poly @ rot.T
+            crater_offs = [((cx * c_ - cy * s_, cx * s_ + cy * c_), cr) for cx, cy, cr in craters]
+            for center in images(rock.pos, rock.radius * 1.15):
+                pts = [at(center, o) for o in offsets]
+                pygame.draw.polygon(surf, ROCK_FILL, pts)
+                for off, cr in crater_offs:  # craters for texture, rotating with the rock
+                    pygame.draw.circle(surf, (58, 55, 68), at(center, off), max(1, int(cr * s)))
+                pygame.draw.polygon(surf, ROCK_EDGE, pts, max(1, int(1.8 * s)))
 
         # Particles (under ships, over rocks)
         if self.effects:
@@ -347,54 +378,61 @@ class Renderer:
                 f = max(0.0, p.life / p.max_life)
                 r = max(1, int(p.radius * s * (1.6 - f if p.kind == "smoke" else f)))
                 col = tuple(min(255, int(c * (f ** 0.6))) for c in p.color)
-                pygame.draw.circle(surf, col, to_px((p.x, p.y)), r)
+                for center in images((p.x, p.y), p.radius * 2):
+                    pygame.draw.circle(surf, col, (int(center[0]), int(center[1])), r)
 
         # Bullets: bright core with a tapering glow tail so incoming fire is easy to read
         for b in env.bullets:
-            if not b.active or not self._visible(b.pos, cam, 40.0):
+            if not b.active:
                 continue
             glow = TEAM_COLORS[b.team_id]["glow"]
-            px = to_px(b.pos)
-            for k, (mult, fade) in enumerate(((4.0, 0.25), (2.2, 0.55))):
-                tail = (b.pos[0] - b.vel[0] * mult, b.pos[1] - b.vel[1] * mult)
-                pygame.draw.line(surf, tuple(int(c * fade) for c in glow), to_px(tail), px,
-                                 max(1, int((4 - k) * s)))
-            pygame.draw.circle(surf, glow, px, max(3, int(b.radius * s * 2.0)))
-            pygame.draw.circle(surf, BULLET_CORE, px, max(2, int(b.radius * s * 1.1)))
+            tail_len = 4.0 * math.hypot(b.vel[0], b.vel[1])
+            for center in images(b.pos, b.radius + tail_len):
+                px = (int(center[0]), int(center[1]))
+                for k, (mult, fade) in enumerate(((4.0, 0.25), (2.2, 0.55))):
+                    tail = at(center, (-b.vel[0] * mult, -b.vel[1] * mult))
+                    pygame.draw.line(surf, tuple(int(c * fade) for c in glow), tail, px,
+                                     max(1, int((4 - k) * s)))
+                pygame.draw.circle(surf, glow, px, max(3, int(b.radius * s * 2.0)))
+                pygame.draw.circle(surf, BULLET_CORE, px, max(2, int(b.radius * s * 1.1)))
 
         # Ships
         for name, ship in env.ships.items():
             if not ship.active:
                 continue
-            if not self._visible(ship.pos, cam, ship.radius * 2):
-                continue
             col = TEAM_COLORS[ship.team_id]
             a, r = ship.angle, ship.radius
-            hull = [to_px(ship.pos + (math.cos(a + o) * r * m, math.sin(a + o) * r * m))
-                    for o, m in ((0.0, 1.45), (2.45, 1.0), (math.pi, 0.45), (-2.45, 1.0))]
+            hull_offs = [(math.cos(a + o) * r * m, math.sin(a + o) * r * m)
+                         for o, m in ((0.0, 1.45), (2.45, 1.0), (math.pi, 0.45), (-2.45, 1.0))]
+            flame_offs = None
             if self.effects and ship.thrusting:  # thruster flame opposite the heading
                 flick = 0.75 + 0.5 * self.rng.random()
-                base = ship.pos + (math.cos(a + math.pi) * r * 0.5, math.sin(a + math.pi) * r * 0.5)
-                tip = ship.pos + (math.cos(a + math.pi) * r * (1.0 + 1.5 * flick),
-                                  math.sin(a + math.pi) * r * (1.0 + 1.5 * flick))
-                side = [ship.pos + (math.cos(a + math.pi + o) * r * 0.5, math.sin(a + math.pi + o) * r * 0.5)
-                        for o in (0.85, -0.85)]
-                pygame.draw.polygon(surf, (255, int(150 + 80 * flick), 60),
-                                    [to_px(side[0]), to_px(tip), to_px(side[1]), to_px(base)])
+                back = a + math.pi
+                flame_offs = [(math.cos(back + 0.85) * r * 0.5, math.sin(back + 0.85) * r * 0.5),
+                              (math.cos(back) * r * (1.0 + 1.5 * flick),
+                               math.sin(back) * r * (1.0 + 1.5 * flick)),
+                              (math.cos(back - 0.85) * r * 0.5, math.sin(back - 0.85) * r * 0.5),
+                              (math.cos(back) * r * 0.5, math.sin(back) * r * 0.5)]
+                flame_col = (255, int(150 + 80 * flick), 60)
             body = col["hull"]
             if self.effects and st.flash.get(name, 0) > 0:  # white flash on taking damage
                 body = (255, 255, 255)
-            pygame.draw.polygon(surf, body, hull)
             # Bright outline while armed, dim while reloading: readable weapon state at a glance.
             armed = ship.cooldown <= 0
             edge = (250, 250, 255) if armed else tuple(int(c * 0.45) for c in col["hull"])
-            pygame.draw.polygon(surf, edge, hull, max(1, int(2.0 * s)))
-            if not armed:  # reload arc shrinking toward the nose
-                frac = 1.0 - ship.cooldown / max(1, ship.fire_rate)
-                nose = ship.pos + (math.cos(a) * r * 1.45, math.sin(a) * r * 1.45)
-                pygame.draw.circle(surf, tuple(int(c * frac) for c in col["glow"]),
-                                   to_px(nose), max(1, int(2.6 * s * frac)))
-            self._draw_health_bar(surf, ship, to_px)
+            # Radius covers the flame, the health bar above the ship, and the reload dot
+            for center in images(ship.pos, r * 3.0):
+                if flame_offs is not None:
+                    pygame.draw.polygon(surf, flame_col, [at(center, o) for o in flame_offs])
+                hull = [at(center, o) for o in hull_offs]
+                pygame.draw.polygon(surf, body, hull)
+                pygame.draw.polygon(surf, edge, hull, max(1, int(2.0 * s)))
+                if not armed:  # reload dot at the nose, growing as the shot comes back
+                    frac = 1.0 - ship.cooldown / max(1, ship.fire_rate)
+                    nose = at(center, (math.cos(a) * r * 1.45, math.sin(a) * r * 1.45))
+                    pygame.draw.circle(surf, tuple(int(c * frac) for c in col["glow"]),
+                                       nose, max(1, int(2.6 * s * frac)))
+                self._draw_health_bar(surf, ship, center)
 
         if self.show_obs:
             agent = self.obs_agent or self.follow or next(iter(env.ships), None)
@@ -418,13 +456,13 @@ class Renderer:
             return surf
         return np.transpose(np.array(pygame.surfarray.pixels3d(surf)), (1, 0, 2)).copy()
 
-    def _draw_health_bar(self, surf, ship, to_px):
-        """Segmented bar above the ship: hull blocks plus shield blocks."""
+    def _draw_health_bar(self, surf, ship, center):
+        """Segmented bar above the ship (at pixel ``center``): hull blocks plus shield blocks."""
         import pygame
 
         if ship.max_hp <= 0:
             return
-        px, py = to_px(ship.pos)
+        px, py = int(center[0]), int(center[1])
         seg = max(3, int(5 * self.scale))
         gap = max(1, int(1.5 * self.scale))
         total = ship.max_hp * seg + (ship.max_hp - 1) * gap
@@ -564,8 +602,9 @@ class Renderer:
                 bx, by, r = float(slot[1]), float(slot[2]), float(min(slot[3], 0.999))
                 dist = r * L / max(1e-6, 1.0 - r)
                 world_ang = ship.angle + math.atan2(by, bx)
-                pos = (ship.pos[0] + math.cos(world_ang) * dist,
-                       ship.pos[1] + math.sin(world_ang) * dist)
+                # Wrap into the map so a contact decoded across the edge lands on screen
+                pos = ((ship.pos[0] + math.cos(world_ang) * dist) % env.width,
+                       (ship.pos[1] + math.sin(world_ang) * dist) % env.height)
                 px = to_px(pos)
                 size = 7 if kind in ("enemy", "ally") else 4
                 pygame.draw.circle(surf, color, px, size, 1)
@@ -577,8 +616,10 @@ class Renderer:
                     rvx, rvy = float(slot[4]) * vref, float(slot[5]) * vref
                     ca, sa = math.cos(ship.angle), math.sin(ship.angle)
                     wvx, wvy = ca * rvx - sa * rvy, sa * rvx + ca * rvy
-                    pygame.draw.line(surf, tuple(int(c * 0.7) for c in color), px,
-                                     to_px((pos[0] + wvx * 5, pos[1] + wvy * 5)), 1)
+                    # End point offset from the projected marker, not projected on its own,
+                    # so the line cannot wrap away from its start
+                    end = (int(px[0] + wvx * 5 * self.scale), int(px[1] + wvy * 5 * self.scale))
+                    pygame.draw.line(surf, tuple(int(c * 0.7) for c in color), px, end, 1)
             off += count * dim
 
         # Ego readouts, in the same units the policy sees
