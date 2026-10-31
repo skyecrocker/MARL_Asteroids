@@ -22,7 +22,10 @@ marl_asteroids/
                   names / Elo from optional manifest.json files.
   app/
     main.py       App: owns the window, the pygame_gui manager, the screen stack and the loop
-    screens.py    MainMenu, MatchSetup, Game (+ pause overlay), Results, Settings, Gallery
+    screens.py    MainMenu, ExperimentalMenu, MatchSetup, Game (+ pause overlay), Results,
+                  RogueliteGame, Shop, RunOver, Settings, Gallery
+  roguelite.py    RogueliteRun: run state, shop, wave schedule; drives the env between waves.
+                  Plain data and pure functions, no pygame, so a run plays headless in tests.
     settings.py   Persisted preferences and last match setup (~/.config/marl-asteroids/app.json)
 ```
 
@@ -36,7 +39,20 @@ Two refactors make this possible:
 
 ## Screens
 
-- **Main menu:** Play, Gallery, Settings, Quit. (Watch was removed: give your ship to an AI to spectate.)
+- **Main menu:** Roguelite survival, Classic survival, Experimental, Settings, Quit.
+  Classic survival opens match setup with survival preselected.
+- **Experimental:** Custom match (match setup with every mode) and the Gallery.
+- **Roguelite game:** you fly `blue_0` in the medium arena. The side panels show your fleet (with
+  health pips and wingman tier) and the wave, enemies left, credits, and the enemy legend (`L`
+  toggles it). Clearing a wave shows "WAVE CLEARED" for about a second, then pushes the shop; the
+  game screen keeps its env and renderer, so Continue resumes the same run. `Esc` pauses (resume,
+  quit run). Your ship's destruction ends the run.
+- **Shop:** credits and the wave just cleared on top; "Your Ship" and "Wingmen" columns with level,
+  next cost and Buy per item; the legend on the right; Continue (or Enter) starts the next wave.
+  Wingman upgrades unlock with the first wingman. `Esc` does nothing here, so the next wave can't
+  be skipped by accident.
+- **Run over:** wave reached, waves cleared, kills (yours and the fleet's), wingmen, credits
+  earned. New run or main menu.
 - **Match setup:** mode (deathmatch, sudden death, station siege, survival, capture the flag, escort), arena size
   (mini 600 / small 1200 / medium 2400 / large 4800), ships per team, spawns (combat modes), asteroid count, splitting, time limit, a controller per
   ship (you, a trained model, or a scripted bot), difficulty, camera. Defaults to you flying
@@ -46,7 +62,7 @@ Two refactors make this possible:
 - **Results:** winner (or waves survived), how it ended, kills, damage, station damage (siege),
   team kills, crashes. Play again, change setup, or menu.
 - **Settings:** window size, visual effects, minimap, observation overlay default, frame rate.
-- **Gallery:** placeholder listing planned MARL exhibits.
+- **Gallery:** placeholder listing planned MARL exhibits (under Experimental).
 
 Menus run a dimmed bot-vs-bot station siege in the background (scripted bots only, so it never
 needs checkpoints); it can be turned off in Settings.

@@ -9,7 +9,7 @@ the original code, checkpoints, and results are preserved at tag `v0-legacy`.
 ```
 marl_asteroids/
   config.py      GameConfig, RewardConfig, scenario registry, static_battle, handicap helpers
-  entities.py    Ship / Asteroid / Bullet
+  entities.py    Ship (with per-ship ShipStats) / Asteroid / Bullet / Station / Convoy / Flag
   env.py         TeamAsteroidsEnv: physics, collisions, ego-centric observations, rewards
   render.py      Pygame renderer (starfield, flames, particles, trails, HUD) - no sim state
   policies.py    Batched Policy interface: scripted bots, NetworkPolicy, human, DelayedPolicy
@@ -19,7 +19,8 @@ marl_asteroids/
   training.py    Self-play and win-rate evaluation callbacks
   session.py     MatchSpec -> Match: builds playable games (shared by the app and watch.py)
   checkpoints.py Finds trained models compatible with the current observation size
-  app/           Desktop app: menus, match setup, game, results, settings (pygame_gui)
+  roguelite.py   Roguelite survival: run state, shop catalog, enemy variants, tiers, wave schedule
+  app/           Desktop app: menus, match setup, game, results, roguelite shop, settings (pygame_gui)
 scripts/
   app.py         Launch the desktop app (same as `uv run marl-asteroids`)
   train.py       Train (presets: baseline, selfplay)
@@ -49,7 +50,36 @@ uv run pytest
 uv run marl-asteroids
 ```
 
-The main menu has **Play**, **Gallery**, and **Settings**. Match setup picks the mode, arena size
+The main menu has **Roguelite survival** (the flagship mode, below), **Classic survival** (match
+setup with survival preselected), **Experimental** (a custom match in any mode, and the MARL
+Gallery), and **Settings**.
+
+### Roguelite survival
+
+You fly one blue ship in the medium arena (2400) against waves of red. The run ends when your ship
+is destroyed, even if wingmen survive; the score is the wave you reached. Each run starts fresh.
+
+- **Shop between waves.** Clearing a wave opens a two-column shop. *Your Ship*: hull, shield, fire
+  rate, engines. *Wingmen*: buy up to 3 AI wingmen, then upgrade them as a group (intelligence, hull,
+  shield, fire rate, engines). Each level costs 1.5x the last. Credits come from kills (tougher and
+  smarter enemies pay more) plus a bonus per cleared wave.
+- **Wingmen** respawn next to you at the start of every wave. Everyone starts each wave at full
+  health. Friendly fire is off in this mode.
+- **Enemies** come in four types, told apart by silhouette: Standard, Scout (fast, fragile, forked
+  tail), Heavy (slow, tough, broad hull) and Sniper (long range, long barrel, keeps its distance).
+  Intelligence tiers are told apart by shade and markings: Basic (light red), Veteran (darker, one
+  gold pip), Elite (crimson, two pips and a gold ring). Wingmen are cyan, with white pips for their
+  tier. `L` toggles the legend in game; the shop always shows it.
+- **Difficulty ramp.** Waves grow by one ship every two waves (up to 20). Waves 1-2 are Basic
+  Standards; Scouts and Heavies join at wave 3; Snipers and Veterans at wave 6; Elites at wave 9
+  and they are the majority from wave 12.
+
+Everything is scripted bots for now (trained agents only know combat). All tuning (stats, tiers,
+prices, payouts, wave schedule) is data in `DEFAULT_ROGUELITE` in `marl_asteroids/roguelite.py`.
+
+### Custom matches
+
+Match setup picks the mode, arena size
 (Mini 600, Small 1200, Medium 2400, Large 4800), up to 8 ships per team, spawns (deathmatch and sudden death), asteroid
 count, rock type, time limit, and a controller for every ship: you, any compatible trained model
 (shown with its rating), or a scripted bot. You start in Blue 1; to just watch, give your ship to an
