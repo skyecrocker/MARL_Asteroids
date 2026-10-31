@@ -34,6 +34,11 @@ def press(app, text):
     raise KeyError(f"no button {text!r} on {type(app.screen).__name__}")
 
 
+def texts_on(screen):
+    """Text of every label/button on a screen."""
+    return {el.text for el in screen.root.get_container().elements if hasattr(el, "text")}
+
+
 def run_until(app, screen_type, limit=20000):
     for _ in range(limit):
         if isinstance(app.screen, screen_type):
@@ -56,7 +61,7 @@ def test_settings_defaults_when_missing_or_corrupt(tmp_path):
 
 def test_settings_round_trip_and_tolerance(tmp_path):
     p = tmp_path / "s.json"
-    s = AppSettings(window=[1600, 1000], effects=False, last_play={"scenario": "duel"})
+    s = AppSettings(window=[1600, 1000], effects=False, last_setup={"mode": "siege"})
     s.save(p)
     assert AppSettings.load(p) == s
     data = json.loads(p.read_text())
@@ -82,26 +87,68 @@ def test_config_path_env_override(tmp_path, monkeypatch):
 # ----------------------------------------------------------------------------- setup
 
 
-def test_sanitize_replaces_missing_models_and_scenarios():
-    spec = MatchSpec(scenario="duel", controllers={"blue_0": "models/gone.zip", "red_0": "dummy"},
+def test_sanitize_replaces_missing_models_and_bad_settings():
+    spec = MatchSpec(mode="deathmatch", arena="small", m_blue=9, n_red=1,
+                     controllers={"blue_0": "models/gone.zip", "red_0": "dummy"},
                      default_controller="models/also_gone.zip", difficulty="nightmare")
-    clean = S.sanitize(spec, "watch")
+    clean = S.sanitize(spec)
     assert S.valid_controller(clean.default_controller)
     assert clean.controllers["blue_0"] == clean.default_controller
     assert clean.controllers["red_0"] == "dummy"
     assert clean.difficulty == "normal"
-    assert S.sanitize(MatchSpec(scenario="deleted_mode"), "play").scenario == "demo_team2"
+    assert clean.m_blue == 2 and clean.n_red == 1  # out-of-range team size reset
+    # Unknown mode, unknown arena, or an old scenario-only setup: start from the defaults
+    for bad in (MatchSpec(mode="capture_the_moon", arena="small"),
+                MatchSpec(mode="siege", arena="gigantic"),
+                MatchSpec(scenario="demo_team2")):
+        assert S.sanitize(bad) == S.default_spec()
 
 
-def test_play_defaults_put_you_in_blue_1(app):
-    setup = S.SetupScreen(app, "play")
+def test_defaults_put_you_in_blue_1_in_a_deathmatch(app):
+    setup = S.SetupScreen(app)
     assert setup.spec.controllers["blue_0"] == HUMAN
-    watch = S.SetupScreen(app, "watch")
-    assert HUMAN not in watch.spec.controllers.values()
+    assert setup.spec.mode == "deathmatch" and setup.spec.arena == "medium"
+
+
+def test_main_menu_has_no_watch_button(app):
+    run(app, 1)
+    texts = {el.text for el in app.screen._buttons}
+    assert texts == {"Play", "Gallery", "Settings", "Quit"}
+
+
+def test_switching_to_an_objective_mode_swaps_trained_agents_for_bots(app):
+    setup = S.SetupScreen(app)
+    app.push(setup)
+    setup.spec.controllers = {"blue_0": HUMAN, "blue_1": "models/phaseA/selfplay_final.zip",
+                              "red_0": "models/phaseA/baseline.zip", "red_1": "dummy"}
+    setup._set_mode("siege")
+    assert setup.spec.controllers == {"blue_0": HUMAN, "blue_1": S.BOT, "red_0": S.BOT,
+                                      "red_1": "dummy"}
+    assert "Trained agents" in setup.status
+    assert setup.spec.time_limit == S.KEEP  # mode default clock
+    # The trained agents can still be picked deliberately
+    setup._set_controller("red_0", "models/phaseA/baseline.zip")
+    assert setup.spec.controllers["red_0"] == "models/phaseA/baseline.zip"
+
+
+def test_spawns_option_only_in_deathmatch(app):
+    setup = S.SetupScreen(app)
+    app.push(setup)
+    assert "Spawns" in texts_on(setup)
+    setup._set_mode("survival")
+    assert "Spawns" not in texts_on(setup) and "Max per wave" in texts_on(setup)
+
+
+def test_arena_change_resets_asteroid_count(app):
+    setup = S.SetupScreen(app)
+    app.push(setup)
+    setup._set_asteroids(17)
+    setup._set_arena("huge")
+    assert setup.spec.num_asteroids is None and setup._cfg().width == 2400
 
 
 def test_only_one_human_ship(app):
-    setup = S.SetupScreen(app, "play")
+    setup = S.SetupScreen(app)
     app.push(setup)
     setup._set_controller("red_0", HUMAN)
     humans = [a for a, c in setup.spec.controllers.items() if c == HUMAN]
@@ -109,7 +156,7 @@ def test_only_one_human_ship(app):
 
 
 def test_team_size_change_keeps_existing_choices(app):
-    setup = S.SetupScreen(app, "watch")
+    setup = S.SetupScreen(app)
     app.push(setup)
     setup.spec.controllers["blue_0"] = "dummy"
     setup._set("m_blue", 4, rebuild=True)
@@ -120,18 +167,17 @@ def test_team_size_change_keeps_existing_choices(app):
     assert [a for a in setup.spec.controllers if a.startswith("blue")] == ["blue_0"]
 
 
-def test_scenario_change_resets_scenario_specific_overrides(app):
-    setup = S.SetupScreen(app, "watch")
+def test_mode_change_keeps_team_sizes(app):
+    setup = S.SetupScreen(app)
     app.push(setup)
-    setup._set("n_red", 4, rebuild=True)
-    setup._set_asteroids(17)
-    setup._set_scenario("duel")
-    assert setup.spec.n_red is None and setup.spec.num_asteroids is None
-    assert set(setup.spec.controllers) == {"blue_0", "red_0"}
+    setup._set("n_red", 3, rebuild=True)
+    setup._set_mode("survival")
+    assert setup.spec.n_red == 3 and set(setup.spec.controllers) == {
+        "blue_0", "blue_1", "red_0", "red_1", "red_2"}
 
 
 def test_bad_setup_reports_instead_of_crashing(app, monkeypatch):
-    setup = S.SetupScreen(app, "watch")
+    setup = S.SetupScreen(app)
     app.push(setup)
     monkeypatch.setattr(S, "build_match", lambda spec: (_ for _ in ()).throw(ValueError("boom")))
     setup.start()
@@ -142,10 +188,10 @@ def test_bad_setup_reports_instead_of_crashing(app, monkeypatch):
 # ------------------------------------------------------------------------- full flow
 
 
-def quick_watch(app):
-    """Watch setup with bots and a short clock, so games end fast and deterministically."""
-    setup = S.SetupScreen(app, "watch")
-    setup.spec = MatchSpec(scenario="duel", time_limit=8.0, seed=3,
+def quick_watch(app, mode="deathmatch"):
+    """Bots only and a short clock, so games end fast and deterministically."""
+    setup = S.SetupScreen(app)
+    setup.spec = MatchSpec(mode=mode, arena="small", m_blue=1, n_red=1, time_limit=8.0, seed=3,
                            controllers={"blue_0": "heuristic_1.0", "red_0": "dummy"})
     app.push(setup)
     return setup
@@ -161,14 +207,14 @@ def test_full_flow_through_every_screen(app):
     press(app, "Back"); run(app, 2)
 
     setup = quick_watch(app)
-    press(app, "Start match")
+    press(app, "Start")
     run_until(app, S.GameScreen, limit=10)
     game = app.screen
     assert game.env is not None and game.env.on_frame is not None
     run_until(app, S.ResultsScreen)
     results = app.screen
     assert results.winner == 1 and results.stats.games == 1  # heuristic beats a dummy
-    assert app.settings.last_watch["scenario"] == "duel"     # setup remembered
+    assert app.settings.last_setup["arena"] == "small"       # setup remembered
 
     press(app, "Play again")
     assert isinstance(app.screen, S.GameScreen) and app.screen.game_index == 1
@@ -181,7 +227,7 @@ def test_full_flow_through_every_screen(app):
 
 def test_game_draws_every_physics_frame(app):
     quick_watch(app)
-    press(app, "Start match")
+    press(app, "Start")
     run_until(app, S.GameScreen, limit=10)
     game = app.screen
     before_frames, before_physics = app.frames, game.env.frame
@@ -193,7 +239,7 @@ def test_game_draws_every_physics_frame(app):
 
 def test_pause_freezes_the_game_and_resume_continues(app):
     quick_watch(app)
-    press(app, "Start match")
+    press(app, "Start")
     run_until(app, S.GameScreen, limit=10)
     game = app.screen
     run(app, 5)
@@ -210,7 +256,7 @@ def test_pause_freezes_the_game_and_resume_continues(app):
 
 def test_restart_and_main_menu_from_pause(app):
     quick_watch(app)
-    press(app, "Start match")
+    press(app, "Start")
     run_until(app, S.GameScreen, limit=10)
     game = app.screen
     run(app, 10)
@@ -225,7 +271,7 @@ def test_restart_and_main_menu_from_pause(app):
 
 def test_tab_toggles_sensor_view(app):
     quick_watch(app)
-    press(app, "Start match")
+    press(app, "Start")
     run_until(app, S.GameScreen, limit=10)
     game = app.screen
     start = game.renderer.show_obs
@@ -235,8 +281,9 @@ def test_tab_toggles_sensor_view(app):
 
 
 def test_human_ship_idles_without_input_and_game_still_ends(app):
-    setup = S.SetupScreen(app, "play")
-    setup.spec = MatchSpec(scenario="duel", time_limit=5.0, seed=1, difficulty="brutal",
+    setup = S.SetupScreen(app)
+    setup.spec = MatchSpec(mode="deathmatch", arena="small", m_blue=1, n_red=1, time_limit=5.0,
+                           seed=1, difficulty="brutal",
                            controllers={"blue_0": HUMAN, "red_0": "dummy"})
     app.push(setup)
     press(app, "Start")
@@ -268,3 +315,18 @@ def test_attract_mode_background_runs(tmp_path):
     while a.stack:
         a.stack.pop().exit()
     pygame.quit()
+
+
+@pytest.mark.parametrize("mode", ["siege", "survival"])
+def test_objective_modes_play_through_to_results(app, mode):
+    setup = quick_watch(app, mode)
+    setup.spec.controllers = {"blue_0": "heuristic_1.0", "red_0": "heuristic_1.0"}
+    press(app, "Start")
+    run_until(app, S.ResultsScreen)
+    results = app.screen
+    assert results.summary["mode"] == mode
+    texts = texts_on(results)
+    if mode == "survival":
+        assert any(t.startswith("Survived") for t in texts)
+    else:
+        assert "Station damage" in texts

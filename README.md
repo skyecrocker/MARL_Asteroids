@@ -49,10 +49,27 @@ uv run pytest
 uv run marl-asteroids
 ```
 
-The main menu has **Play**, **Watch**, **Gallery**, and **Settings**. Match setup picks the
-scenario, team sizes, arena size, asteroid count, rock type, time limit, and a controller for every
-ship: you, any compatible trained model (shown with its rating), or a scripted bot. Play puts you in
-Blue 1 by default; Watch is AI on both sides. Your last setup for each is remembered.
+The main menu has **Play**, **Gallery**, and **Settings**. Match setup picks the mode, arena size
+(Small 800, Medium 1200, Large 1600, Huge 2400), ships per team, spawns (deathmatch), asteroid
+count, rock type, time limit, and a controller for every ship: you, any compatible trained model
+(shown with its rating), or a scripted bot. You start in Blue 1; to just watch, give your ship to an
+AI. Your last setup is remembered.
+
+### Game modes
+
+| Mode | Rules |
+|---|---|
+| **Deathmatch** | Destroy every enemy ship. No respawns. |
+| **Station siege** | Each team has a station. Destroyed ships respawn at it after 3 s, with 1.5 s of spawn protection. Destroy the enemy station to stop their respawns, then wipe out the fleet. Default limit 5 min; the station with more health wins a timeout. |
+| **Survival** | Blue against growing waves of red. The first wave is half blue's size; each wave adds a ship, up to the red team size. Clearing a wave brings fallen blue ships back and repairs every hull. Lasting until a time limit counts as a win. |
+
+A station's shield regenerates continuously at 1.6 points/s, between one and two ships' damage
+output, so a lone attacker barely dents it while two or three take it down in 10-25 s
+(`tests/test_modes.py` pins this). Your own fire passes through your station; ships bounce off any
+station, and ramming an enemy one hurts only the ship.
+
+The trained agents only know deathmatch (they can't see stations or waves), so picking siege or
+survival swaps AI ships to the objective-aware scripted bot; you can still pick a trained agent.
 
 In game: `W`/`Up` thrust, `A`/`D` or arrows to turn, `Space` to shoot, `Esc` to pause (resume,
 restart, change setup, main menu), `Tab` for the sensor view.
@@ -68,7 +85,9 @@ place windows off screen.
 ## Command line
 
 Run from the repo root. The scripts are still the way to train and evaluate, and `watch.py` offers
-recording and a few options the app doesn't.
+recording and a few options the app doesn't. It takes either a named scenario (`--scenario`, the
+fixed set the evaluations use) or a mode and arena like the app:
+`--mode siege --arena small --blue-ships 2 --red-ships 2`.
 
 ```bash
 # Train

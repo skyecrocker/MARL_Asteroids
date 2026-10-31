@@ -248,6 +248,8 @@ class Renderer:
             st.prev_hp[name] = ship.hp
             st.flash[name] = max(0, st.flash.get(name, 0) - 1)
         for name, ship in env.ships.items():
+            if ship.reserve:  # survival ships waiting for their wave were never in play
+                continue
             if not ship.active and name not in st.dead_seen:
                 st.dead_seen.add(name)
                 c = TEAM_COLORS[ship.team_id]
@@ -255,7 +257,22 @@ class Renderer:
                 self._spawn_burst(ship.pos[0], ship.pos[1], 16, 1.6, (255, 226, 150), 20, 5.0, "smoke")
                 st.shake = min(16.0, st.shake + 9.0)
             elif ship.active and name in st.dead_seen:
-                st.dead_seen.discard(name)  # new episode
+                st.dead_seen.discard(name)  # respawned (or a new episode)
+                st.trails[name] = []        # don't draw a trail from the wreck to the spawn point
+        for team, station in env.stations.items():
+            key = ("station", team)
+            prev = st.prev_hp.get(key)
+            if prev is not None and station.hp < prev:
+                st.flash[key] = 5
+                self._spawn_burst(station.pos[0], station.pos[1], 6, 2.5, (255, 240, 200), 10, 2.0)
+            if not station.active and key not in st.dead_seen:
+                st.dead_seen.add(key)
+                c = TEAM_COLORS[team]
+                self._spawn_burst(station.pos[0], station.pos[1], 90, 6.0, c["glow"], 50, 4.0, "spark")
+                self._spawn_burst(station.pos[0], station.pos[1], 40, 3.0, (255, 226, 150), 45, 9.0, "smoke")
+                st.shake = 24.0
+            st.prev_hp[key] = station.hp
+            st.flash[key] = max(0, st.flash.get(key, 0) - 1)
         n = len(env.bullets)
         if n > st.prev_bullets:
             for b in env.bullets[st.prev_bullets:n]:
@@ -372,6 +389,11 @@ class Renderer:
                     pygame.draw.circle(surf, (58, 55, 68), at(center, off), max(1, int(cr * s)))
                 pygame.draw.polygon(surf, ROCK_EDGE, pts, max(1, int(1.8 * s)))
 
+        # Stations (siege)
+        for team, station in env.stations.items():
+            for center in images(station.pos, station.radius * 1.7):
+                self._draw_station(surf, station, center, at)
+
         # Particles (under ships, over rocks)
         if self.effects:
             for p in st.particles:
@@ -427,6 +449,9 @@ class Renderer:
                 hull = [at(center, o) for o in hull_offs]
                 pygame.draw.polygon(surf, body, hull)
                 pygame.draw.polygon(surf, edge, hull, max(1, int(2.0 * s)))
+                if ship.protection > 0 and (env.frame // 5) % 2 == 0:  # spawn protection: pulsing bubble
+                    pygame.draw.circle(surf, (190, 225, 255), (int(center[0]), int(center[1])),
+                                       max(6, int(r * 1.9 * s)), 1)
                 if not armed:  # reload dot at the nose, growing as the shot comes back
                     frac = 1.0 - ship.cooldown / max(1, ship.fire_rate)
                     nose = at(center, (math.cos(a) * r * 1.45, math.sin(a) * r * 1.45))
@@ -455,6 +480,53 @@ class Renderer:
         if mode == "surface":  # caller blits it into a window it owns
             return surf
         return np.transpose(np.array(pygame.surfarray.pixels3d(surf)), (1, 0, 2)).copy()
+
+    def _draw_station(self, surf, station, center, at):
+        """Octagonal hull, rotating ring, glowing core, shield bubble, and shield/hull bars."""
+        import pygame
+
+        s = self.scale
+        cx, cy = int(center[0]), int(center[1])
+        R = station.radius
+        col = TEAM_COLORS[station.team_id]
+        octagon = [(math.cos(k * math.pi / 4 + math.pi / 8) * R, math.sin(k * math.pi / 4 + math.pi / 8) * R)
+                   for k in range(8)]
+        if not station.active:  # wreck
+            pygame.draw.polygon(surf, (44, 42, 52), [at(center, o) for o in octagon])
+            pygame.draw.polygon(surf, (78, 74, 88), [at(center, o) for o in octagon], max(1, int(2 * s)))
+            return
+        flash = self.effects and self.state.flash.get(("station", station.team_id), 0) > 0
+        fill = (255, 255, 255) if flash else tuple(int(c * 0.55) for c in col["trail"])
+        pts = [at(center, o) for o in octagon]
+        pygame.draw.polygon(surf, fill, pts)
+        pygame.draw.polygon(surf, col["hull"], pts, max(2, int(3 * s)))
+        # Rotating ring of docking lights
+        spin = self.env.frame * 0.01
+        for k in range(6):
+            a = spin + k * math.pi / 3
+            pygame.draw.circle(surf, col["glow"], at(center, (math.cos(a) * R * 0.68, math.sin(a) * R * 0.68)),
+                               max(1, int(2.5 * s)))
+        pygame.draw.circle(surf, col["glow"], (cx, cy), max(3, int(R * 0.3 * s)))
+        pygame.draw.circle(surf, (255, 255, 255), (cx, cy), max(1, int(R * 0.12 * s)))
+        # Shield bubble, brighter the fuller it is
+        frac = station.shield / max(1, station.max_shield)
+        if frac > 0:
+            rr = int((R + 9) * s)
+            bubble = pygame.Surface((2 * rr + 4, 2 * rr + 4), pygame.SRCALPHA)
+            alpha = int(40 + 130 * frac)
+            pygame.draw.circle(bubble, (110, 220, 255, alpha), (rr + 2, rr + 2), rr, max(1, int(2 * s)))
+            surf.blit(bubble, (cx - rr - 2, cy - rr - 2))
+        # Bars above: shield on top, hull below
+        bw = int(R * 2.4 * s)
+        bh = max(3, int(4 * s))
+        x0 = cx - bw // 2
+        y0 = cy - int((R + 22) * s)
+        hull_frac = station.hull / max(1, station.max_hull)
+        hull_col = (120, 230, 140) if hull_frac > 0.35 else (255, 120, 110)
+        for i, (f, c) in enumerate(((frac, (110, 220, 255)), (hull_frac, hull_col))):
+            y = y0 + i * (bh + 2)
+            pygame.draw.rect(surf, (30, 34, 48), (x0, y, bw, bh))
+            pygame.draw.rect(surf, c, (x0, y, int(bw * f), bh))
 
     def _draw_health_bar(self, surf, ship, center):
         """Segmented bar above the ship (at pixel ``center``): hull blocks plus shield blocks."""
@@ -524,6 +596,19 @@ class Renderer:
             lx = min(max(ex - label.get_width() / 2, 2), w - label.get_width() - 2)
             ly = min(max(ey - math.sin(ang) * 16 - 6, 2), h - label.get_height() - 2)
             surf.blit(label, (int(lx), int(ly)))
+        # Stations: square markers, so the objective is always findable
+        for team, station in self.env.stations.items():
+            if not station.active or self._visible(station.pos, cam, station.radius):
+                continue
+            dx, dy = self._wrapped_delta(cam, station.pos)
+            px, py = dx * self.scale, dy * self.scale
+            if abs(px) < 1e-6 and abs(py) < 1e-6:
+                continue
+            t = min((cx - margin) / max(abs(px), 1e-6), (cy - margin) / max(abs(py), 1e-6))
+            ex, ey = int(cx + px * t), int(cy + py * t)
+            col = TEAM_COLORS[team]["hull"]
+            pygame.draw.rect(surf, col, (ex - 7, ey - 7, 14, 14), 2)
+            pygame.draw.rect(surf, col, (ex - 3, ey - 3, 6, 6))
 
     def _draw_minimap(self, surf, cam):
         """Whole-map inset: rocks, ships, the followed ship, and the current viewport."""
@@ -553,6 +638,11 @@ class Renderer:
             pygame.draw.circle(surf, col, mp(ship.pos), 3 if name == self.follow else 2)
             if name == self.follow:
                 pygame.draw.circle(surf, (255, 255, 255), mp(ship.pos), 5, 1)
+        for team, station in env.stations.items():
+            half = max(3, int(station.radius * k))
+            x, y = mp(station.pos)
+            color = TEAM_COLORS[team]["hull"] if station.active else (80, 80, 92)
+            pygame.draw.rect(surf, color, (x - half, y - half, 2 * half, 2 * half), 0 if station.active else 1)
         # Viewport box, tiled so it wraps with the torus. Uses a clip region rather than clipping the
         # rects themselves, which would draw false edges along the panel border.
         if self.view_size >= max(env.width, env.height) - 1:
@@ -642,13 +732,41 @@ class Renderer:
         import pygame
 
         red, blue = env._team_alive(RED), env._team_alive(BLUE)
-        surf.blit(self.font.render(f"RED {red}  hp {env.team_hp(RED)}", True,
+        extra = {RED: f"hp {env.team_hp(RED)}", BLUE: f"hp {env.team_hp(BLUE)}"}
+        for team, station in env.stations.items():
+            extra[team] = (f"station {station.health_fraction:.0%}" if station.active
+                           else "station lost")
+        surf.blit(self.font.render(f"RED {red}  {extra[RED]}", True,
                                    TEAM_COLORS[RED]["hull"]), (14, 12))
-        label = self.font.render(f"hp {env.team_hp(BLUE)}  BLUE {blue}", True, TEAM_COLORS[BLUE]["hull"])
+        label = self.font.render(f"{extra[BLUE]}  BLUE {blue}", True, TEAM_COLORS[BLUE]["hull"])
         surf.blit(label, (surf.get_width() - label.get_width() - 14, 12))
+
+        def clock(frames):
+            secs = int(frames // 60)
+            return f"{secs // 60}:{secs % 60:02d}"
+
         limit = env.config.max_frames
-        t = self.font.render(f"{env.frame}" if limit is None else f"{env.frame}/{limit}", True, HUD_DIM)
+        center = clock(env.frame) if limit is None else f"{clock(env.frame)} / {clock(limit)}"
+        if env.mode == "survival":
+            if env.wave_cooldown is not None:
+                center = f"Wave {env.wave + 1} in {env.wave_cooldown / 60:.0f}s   {center}"
+            else:
+                center = f"Wave {env.wave}  ·  {red} left   {center}"
+        t = self.font.render(center, True, HUD_DIM if env.mode != "survival" else HUD_TEXT)
         surf.blit(t, ((surf.get_width() - t.get_width()) // 2, 12))
+        # The followed ship is down: say when (or whether) it comes back
+        followed = env.ships.get(self.follow) if self.follow else None
+        if followed is not None and not followed.active and not env.game_over:
+            if followed.respawn_timer is not None:
+                msg = f"Respawning in {followed.respawn_timer / 60:.1f}s"
+            elif env.mode == "siege":
+                msg = "Station destroyed: no respawn"
+            elif env.mode == "survival":
+                msg = "Down. You return when the wave is cleared"
+            else:
+                msg = "Destroyed"
+            m = self.font_big.render(msg, True, HUD_TEXT)
+            surf.blit(m, ((surf.get_width() - m.get_width()) // 2, int(surf.get_height() * 0.62)))
         if limit is not None:  # no clock bar when the game has no time limit
             bar_w = surf.get_width() - 28
             frac = min(1.0, env.frame / max(1, limit))
@@ -656,6 +774,9 @@ class Renderer:
             pygame.draw.rect(surf, HUD_DIM, (14, 34, int(bar_w * frac), 3))
         if env.game_over:
             msg = {BLUE: "BLUE WINS", RED: "RED WINS"}.get(env.winner, "DRAW")
+            if env.mode == "survival":
+                n = env.waves_cleared
+                msg = f"SURVIVED {n} WAVE{'S' if n != 1 else ''}"
             color = TEAM_COLORS.get(env.winner, {}).get("hull", HUD_TEXT)
             surface = self.font_big.render(msg, True, color)
             surf.blit(surface, ((surf.get_width() - surface.get_width()) // 2,

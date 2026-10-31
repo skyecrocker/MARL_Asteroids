@@ -11,7 +11,7 @@ from pygame_gui.elements import (UIButton, UIDropDownMenu, UIHorizontalSlider, U
                                  UITextBox)
 
 from ..checkpoints import discover
-from ..config import SCENARIOS, get_scenario
+from ..config import ARENA_SIZES, MODE_NAMES, MODE_TIME_LIMIT, MODES
 from ..render import TEAM_COLORS, Renderer
 from ..env import BLUE, RED
 from ..session import DIFFICULTY, HUMAN, KEEP, PHYSICS_FPS, MatchSpec, agent_names, build_config, build_match
@@ -20,26 +20,10 @@ from .settings import WINDOW_SIZES
 
 # ----------------------------------------------------------------------------- vocabulary
 
-SCENARIO_LABELS = {
-    "demo_duel": "Arena duel",
-    "demo_open": "Open arena duel",
-    "demo_team2": "Arena 2v2",
-    "demo_team3": "Arena 3v3",
-    "demo_team2_large": "Large arena 2v2",
-    "duel": "Duel, open space",
-    "duel_rocks": "Duel with asteroids",
-    "team2": "Skirmish 2v2",
-    "team3": "Skirmish 3v3",
-    "team2_vs_1": "Outnumbered (2 vs 1)",
-    "asteroid_storm": "Asteroid storm 2v2",
-    "obstacles": "Cover 2v2 (solid rocks)",
-    "duel_large": "Large duel",
-    "team2_large": "Large skirmish 2v2",
-    "team3_large": "Large skirmish 3v3",
-    "team3_huge": "Huge skirmish 3v3",
-}
-# Arenas first (fixed symmetric spawns, no clock), then everything else
-SCENARIO_ORDER = sorted(SCENARIOS, key=lambda s: (not s.startswith("demo_"), s))
+MODE_OPTIONS = [(MODE_NAMES[m], m) for m in MODES]
+ARENA_OPTIONS = [(f"{name.capitalize()} ({size:.0f})", name) for name, size in ARENA_SIZES.items()]
+SPAWN_OPTIONS = [("Fixed (facing off)", True), ("Random", False)]
+BOT = "heuristic_1.0"  # default AI in modes the trained agents haven't learned
 
 SCRIPTED = [
     ("Bot: heuristic", "heuristic_1.0"),
@@ -51,7 +35,6 @@ SCRIPTED = [
 ]
 DIFFICULTY_OPTIONS = [("Easy", "easy"), ("Normal", "normal"), ("Hard", "hard"),
                       ("Brutal (no handicap)", "brutal")]
-SCALE_OPTIONS = [("1x", 1.0), ("1.5x", 1.5), ("2x", 2.0), ("3x", 3.0), ("4x", 4.0)]
 VIEW_OPTIONS = [("Close", 800.0), ("Medium", 1200.0), ("Wide", 1800.0)]
 TEAM_SIZE_OPTIONS = [(str(n), n) for n in range(1, 5)]
 TIME_OPTIONS = [("No limit", None), ("1 minute", 60.0), ("2 minutes", 120.0),
@@ -219,9 +202,8 @@ class MainMenuScreen(MenuScreen):
         self.label((0, y - 6, w, 84), "MARL ASTEROIDS", "#title")
         self.label((0, y + 74, w, 30), "Multi-agent reinforcement learning, in space", "#subtitle")
         y += 140
-        self.card((x - 30, y - 20, col + 60, 5 * 62 + 30))
-        for text, cb in (("Play", lambda: self.app.push(SetupScreen(self.app, "play"))),
-                         ("Watch", lambda: self.app.push(SetupScreen(self.app, "watch"))),
+        self.card((x - 30, y - 20, col + 60, 4 * 62 + 30))
+        for text, cb in (("Play", lambda: self.app.push(SetupScreen(self.app))),
                          ("Gallery", lambda: self.app.push(GalleryScreen(self.app))),
                          ("Settings", lambda: self.app.push(SettingsScreen(self.app))),
                          ("Quit", self.app.quit)):
@@ -239,24 +221,28 @@ class MainMenuScreen(MenuScreen):
 # ------------------------------------------------------------------------- match setup
 
 
-def default_spec(mode: str) -> MatchSpec:
-    if mode == "play":
-        spec = MatchSpec(scenario="demo_team2", difficulty="normal",
-                         controllers={"blue_0": HUMAN, "blue_1": best_model(0)},
-                         default_controller=best_model(0))
-    else:
-        spec = MatchSpec(scenario="demo_team3", default_controller=best_model(0))
-        cfg = build_config(spec)
-        spec.controllers = {a: best_model(0 if a.startswith("blue") else 2) for a in agent_names(cfg)}
-    return spec
+def is_trained(controller: str) -> bool:
+    return controller.endswith(".zip")
 
 
-def sanitize(spec: MatchSpec, mode: str) -> MatchSpec:
-    """Make a saved setup safe to use: unknown scenario or missing models fall back to defaults."""
-    if spec.scenario not in SCENARIOS:
-        return default_spec(mode)
+def default_spec() -> MatchSpec:
+    """You plus the strongest AI wingman against two of the strongest AI, 2v2 deathmatch."""
+    ai = best_model(0)
+    return MatchSpec(mode="deathmatch", arena="medium", m_blue=2, n_red=2, difficulty="normal",
+                     default_controller=ai,
+                     controllers={"blue_0": HUMAN, "blue_1": ai, "red_0": ai, "red_1": ai})
+
+
+def sanitize(spec: MatchSpec) -> MatchSpec:
+    """Make a saved setup safe to use: unknown modes/sizes or missing models fall back."""
+    if spec.arena not in ARENA_SIZES or spec.mode not in MODES:
+        return default_spec()
+    for side in ("m_blue", "n_red"):
+        value = getattr(spec, side)
+        if not isinstance(value, int) or not 1 <= value <= 4:
+            setattr(spec, side, 2)
     if not valid_controller(spec.default_controller):
-        spec.default_controller = best_model(0)
+        spec.default_controller = best_model(0) if spec.mode == "deathmatch" else BOT
     for agent, controller in list(spec.controllers.items()):
         if not valid_controller(controller):
             spec.controllers[agent] = spec.default_controller
@@ -266,14 +252,13 @@ def sanitize(spec: MatchSpec, mode: str) -> MatchSpec:
 
 
 class SetupScreen(MenuScreen):
-    ROW = 46
+    ROW = 44
 
-    def __init__(self, app, mode: str):
+    def __init__(self, app):
         super().__init__(app)
-        self.mode = mode  # "play" or "watch"
         models(refresh=True)  # pick up checkpoints trained since the app started
-        saved = app.settings.last_play if mode == "play" else app.settings.last_watch
-        self.spec = sanitize(MatchSpec.from_dict(saved), mode) if saved else default_spec(mode)
+        saved = app.settings.last_setup
+        self.spec = sanitize(MatchSpec.from_dict(saved)) if saved else default_spec()
         self._sync_controllers()
         self.status = ""
         self.status_is_error = False
@@ -291,7 +276,7 @@ class SetupScreen(MenuScreen):
 
     def _set(self, field, value, rebuild=False):
         setattr(self.spec, field, value)
-        if field in ("scenario", "n_red", "m_blue"):
+        if field in ("n_red", "m_blue"):
             self._sync_controllers()
         self.status = ""
         if rebuild:
@@ -299,23 +284,32 @@ class SetupScreen(MenuScreen):
         else:
             self._refresh_preview()
 
-    def _set_scenario(self, name):
-        # A new scenario brings its own team sizes, rocks and clock
-        self.spec.n_red = self.spec.m_blue = None
-        self.spec.num_asteroids = None
-        self.spec.asteroids_split = None
-        self.spec.time_limit = KEEP
-        self._set("scenario", name, rebuild=True)
+    def _set_mode(self, mode):
+        self.spec.mode = mode
+        self.spec.time_limit = KEEP  # each mode has its own sensible default clock
+        self.status, self.status_is_error = "", False
+        if mode != "deathmatch":
+            # The trained agents only know deathmatch: they ignore stations and waves entirely.
+            # Swap them for objective-aware bots so the mode actually gets played.
+            swapped = [a for a, c in self.spec.controllers.items() if is_trained(c)]
+            for a in swapped:
+                self.spec.controllers[a] = BOT
+            if is_trained(self.spec.default_controller):
+                self.spec.default_controller = BOT
+            if swapped:
+                self.status = ("Trained agents only know deathmatch, so AI ships now use bots. "
+                               "You can still pick them.")
+        self.rebuild()
+
+    def _set_arena(self, arena):
+        self.spec.num_asteroids = None  # new arena, its own default rock count
+        self._set("arena", arena, rebuild=True)
 
     def _set_controller(self, agent, controller):
         if controller == HUMAN:  # one keyboard: picking yourself here frees any other ship
             for other, c in self.spec.controllers.items():
                 if c == HUMAN and other != agent:
                     self.spec.controllers[other] = self.spec.default_controller
-            self.spec.controllers[agent] = controller
-            self.status = ""
-            self.rebuild()
-            return
         self.spec.controllers[agent] = controller
         self.status = ""
         self.rebuild()
@@ -324,9 +318,8 @@ class SetupScreen(MenuScreen):
     def build(self):
         w, h = self.app.size
         cfg = self._cfg()
-        base = get_scenario(self.spec.scenario)
-        title = "Play" if self.mode == "play" else "Watch"
-        self.label((60, 24, w - 120, 40), f"{title}: match setup", "#heading")
+        mode = self.spec.mode
+        self.label((60, 24, w - 120, 40), "Match setup", "#heading")
 
         gap = 30
         card_w = (w - 120 - gap) // 2
@@ -340,7 +333,7 @@ class SetupScreen(MenuScreen):
         # Left: match
         x, y = left.x + 20, left.y + 16
         self.label((x, y, 300, 30), "Match", "#heading")
-        y += 44
+        y += 42
 
         def row(name):
             nonlocal y
@@ -349,14 +342,20 @@ class SetupScreen(MenuScreen):
             y += self.ROW
             return r
 
-        scen_opts = [(SCENARIO_LABELS.get(s, s), s) for s in SCENARIO_ORDER]
-        self.choice(row("Scenario"), scen_opts, self.spec.scenario, self._set_scenario)
+        self.choice(row("Mode"), MODE_OPTIONS, mode, self._set_mode)
+        # Tall enough for two lines at the narrowest window, so it never needs a scrollbar
+        self.text((x - 4, y - 10, card_w - 32, 66),
+                  f"<font color='#8a98b8'>{MODES[mode]}</font>", "#mode_blurb")
+        y += 50
+        self.choice(row("Arena size"), ARENA_OPTIONS, self.spec.arena, self._set_arena)
         self.choice(row("Blue ships"), TEAM_SIZE_OPTIONS, cfg.m_blue,
                     lambda v: self._set("m_blue", v, rebuild=True))
-        self.choice(row("Red ships"), TEAM_SIZE_OPTIONS, cfg.n_red,
+        red_label = "Max per wave" if mode == "survival" else "Red ships"
+        self.choice(row(red_label), TEAM_SIZE_OPTIONS, cfg.n_red,
                     lambda v: self._set("n_red", v, rebuild=True))
-        self.choice(row("Arena size"), SCALE_OPTIONS, self.spec.scale,
-                    lambda v: self._set_scale(v))
+        if mode == "deathmatch":
+            self.choice(row("Spawns"), SPAWN_OPTIONS, self.spec.fixed_spawns,
+                        lambda v: self._set("fixed_spawns", v))
 
         r = row("Asteroids")
         slider_w = r[2] - 56
@@ -366,19 +365,20 @@ class SetupScreen(MenuScreen):
 
         self.choice(row("Rocks"), ROCK_OPTIONS, cfg.asteroids_split,
                     lambda v: self._set("asteroids_split", v))
-        time_opts = [(f"Scenario default ({format_time(base.max_frames)})", KEEP)] + TIME_OPTIONS
+        default_frames = None if MODE_TIME_LIMIT[mode] is None else int(MODE_TIME_LIMIT[mode] * 60)
+        time_opts = [(f"Default ({format_time(default_frames)})", KEEP)] + TIME_OPTIONS
         self.choice(row("Time limit"), time_opts, self.spec.time_limit,
                     lambda v: self._set("time_limit", v))
-        self.preview = self.label((x, y + 6, card_w - 40, 26), "", "#hint")
+        self.preview = self.label((x, y + 4, card_w - 40, 26), "", "#hint")
         self._refresh_preview()
 
         # Right: ships. Rows tighten so up to 4v4 plus the 3 settings rows and hint fit the card.
         x, y = right.x + 20, right.y + 16
         self.label((x, y, 300, 30), "Ships", "#heading")
-        y += 44
+        y += 42
         options = controller_options()
         ships = agent_names(cfg)
-        room = right.bottom - y - 3 * self.ROW - 50
+        room = right.bottom - y - 3 * self.ROW - 56
         ship_row = max(36, min(self.ROW, room // max(1, len(ships))))
         for agent in ships:
             oid = "#blue_label" if agent.startswith("blue") else "#red_label"
@@ -394,7 +394,7 @@ class SetupScreen(MenuScreen):
                     lambda v: self._set("difficulty", v))
         y += self.ROW
         cam_opts = [("Auto" + (" (your ship)" if humans else " (whole map)"), "auto"),
-                    ("Whole map", "none")] + [(f"Follow {ship_label(a)}", a) for a in agent_names(cfg)]
+                    ("Whole map", "none")] + [(f"Follow {ship_label(a)}", a) for a in ships]
         follow = self.spec.follow if any(v == self.spec.follow for _, v in cam_opts) else "auto"
         self.label((x, y, lw, 34), "Camera")
         self.choice((x + lw, y, cw, 34), cam_opts, follow, lambda v: self._set("follow", v))
@@ -402,20 +402,19 @@ class SetupScreen(MenuScreen):
         self.label((x, y, lw, 34), "Zoom")
         self.choice((x + lw, y, cw, 34), VIEW_OPTIONS, self.spec.view, lambda v: self._set("view", v))
         y += self.ROW
-        hint = ("Difficulty slows AI reactions and reloads while you play." if humans else
-                "No human ship: AI plays unhandicapped. Pick 'You' on a ship to play.")
+        if mode != "deathmatch" and any(is_trained(c) for c in self.spec.controllers.values()):
+            hint = "Trained agents ignore the objective in this mode (they only know deathmatch)."
+        elif humans:
+            hint = "Difficulty slows AI reactions and reloads while you play."
+        else:
+            hint = "No ship is yours: AI plays unhandicapped. Pick 'You' to play."
         self.label((x, y, card_w - 40, 26), hint, "#hint")
 
         # Footer
         self.button((60, h - 84, 160, 46), "Back", self.back)
-        self.button((w - 60 - 220, h - 84, 220, 46),
-                    "Start" if self.mode == "play" else "Start match", self.start, "#primary_button")
+        self.button((w - 60 - 220, h - 84, 220, 46), "Start", self.start, "#primary_button")
         self.status_label = self.label((240, h - 80, w - 540, 36), self.status,
                                        "#error" if self.status_is_error else "#hint")
-
-    def _set_scale(self, v):
-        self.spec.num_asteroids = None  # new arena, new default rock count
-        self._set("scale", v, rebuild=True)
 
     def _set_asteroids(self, n):
         self.spec.num_asteroids = n
@@ -431,9 +430,8 @@ class SetupScreen(MenuScreen):
         rocks = f"{cfg.num_asteroids} asteroid{'s' if cfg.num_asteroids != 1 else ''}"
         if cfg.num_asteroids:
             rocks += ", splitting" if cfg.asteroids_split else ", solid"
-        fixed = " · fixed spawns" if cfg.red_spawns or cfg.blue_spawns else ""
         self.preview.set_text(f"{cfg.width:.0f} x {cfg.height:.0f} · {rocks} · "
-                              f"{format_time(cfg.max_frames)}{fixed}")
+                              f"{format_time(cfg.max_frames)}")
 
     # start ---------------------------------------------------------------------
     def handle_event(self, event):
@@ -462,11 +460,10 @@ class SetupScreen(MenuScreen):
             self.status, self.status_is_error = f"Can't start: {e}", True
             self.rebuild()
             return
-        key = "last_play" if self.mode == "play" else "last_watch"
-        setattr(self.app.settings, key, self.spec.to_dict())
+        self.app.settings.last_setup = self.spec.to_dict()
         self.app.save_settings()
         self.status = ""
-        self.app.push(GameScreen(self.app, match, self.mode))
+        self.app.push(GameScreen(self.app, match))
 
 
 # -------------------------------------------------------------------------------- game
@@ -475,10 +472,9 @@ class SetupScreen(MenuScreen):
 class GameScreen(MenuScreen):
     END_HOLD_SECONDS = 1.4
 
-    def __init__(self, app, match, mode: str, game_index: int = 0):
+    def __init__(self, app, match, game_index: int = 0):
         super().__init__(app)
         self.match = match
-        self.mode = mode
         self.game_index = game_index
         self.env = None
         self.renderer: Optional[Renderer] = None
@@ -582,8 +578,8 @@ class GameScreen(MenuScreen):
     def _finish(self):
         stats = self.match.stats()
         human = self.match.human_agents[0] if self.match.human_agents else None
-        results = ResultsScreen(self.app, self.match, self.mode, stats, self.env.winner,
-                                self.env.frame, human, self.game_index)
+        results = ResultsScreen(self.app, self.match, stats, self.env.winner, self.env.frame,
+                                human, self.game_index, self.env.summary())
         self.app.replace(results)
 
     def _on_frame(self):
@@ -610,9 +606,30 @@ class GameScreen(MenuScreen):
         name = "BLUE" if team == BLUE else "RED"
         surface.blit(self.font_big.render(name, True, col), (rect.x, rect.y))
         y = rect.y + 34
+        station = env.stations.get(team)
+        if station is not None:  # station health under the team name
+            label = (f"Station {station.health_fraction:.0%}" if station.active else "Station lost")
+            surface.blit(self.font.render(label, True, col if station.active else (150, 90, 90)),
+                         (rect.x, y))
+            bw = min(rect.width, 140)
+            for i, (f, c) in enumerate(((station.shield / max(1, station.max_shield), (110, 220, 255)),
+                                        (station.hull / max(1, station.max_hull), (120, 230, 140)))):
+                pygame.draw.rect(surface, (30, 34, 48), (rect.x, y + 22 + i * 8, bw, 5))
+                pygame.draw.rect(surface, c, (rect.x, y + 22 + i * 8, int(bw * f), 5))
+            y += 52
+        if env.mode == "survival" and team == RED:
+            wave = (f"Wave {env.wave + 1} in {env.wave_cooldown / 60:.0f}s"
+                    if env.wave_cooldown is not None else f"Wave {env.wave}")
+            surface.blit(self.font.render(f"{wave}  ·  cleared {env.waves_cleared}", True, col),
+                         (rect.x, y))
+            y += 28
         for agent in env.team_agents[team]:
             ship = env.ships[agent]
+            if ship.reserve:  # survival ships not in the current wave
+                continue
             who = self.who[agent]
+            if not ship.active and ship.respawn_timer is not None:
+                who = f"respawn in {ship.respawn_timer / 60:.1f}s"
             color = col if ship.active else (90, 96, 112)
             surface.blit(self.font.render(ship_label(agent), True, color), (rect.x, y))
             surface.blit(self.font.render(who[:max(8, rect.width // 9)], True, (150, 160, 182)),
@@ -651,9 +668,10 @@ class GameScreen(MenuScreen):
 
 
 class ResultsScreen(MenuScreen):
-    def __init__(self, app, match, mode, stats, winner, frames, human, game_index):
+    def __init__(self, app, match, stats, winner, frames, human, game_index, summary=None):
         super().__init__(app)
-        self.match, self.mode, self.stats = match, mode, stats
+        self.match, self.stats = match, stats
+        self.summary = summary or {"mode": match.config.mode}
         self.winner, self.frames, self.human, self.game_index = winner, frames, human, game_index
 
     def build(self):
@@ -661,8 +679,17 @@ class ResultsScreen(MenuScreen):
         cw = 560
         x = self.center_x(cw)
         y = int(h * 0.16)
-        self.card((x - 30, y - 20, cw + 60, 400))
-        if self.human:
+        mode = self.summary.get("mode", "deathmatch")
+        rows = [("Kills", "kills"), ("Damage dealt", "damage"),
+                ("Team kills", "teamkills"), ("Crashes", "env_deaths")]
+        if mode == "siege":
+            rows.insert(1, ("Station damage", "station_damage"))
+        # Card hugs the content: title, subtitle, header row, stat rows, buttons
+        self.card((x - 30, y - 20, cw + 60, 20 + 118 + 30 * len(rows) + 56 + 46 + 30))
+        if mode == "survival":
+            n = self.summary.get("waves_cleared", 0)
+            title = f"Survived {n} wave{'s' if n != 1 else ''}"
+        elif self.human:
             my_team = BLUE if self.human.startswith("blue") else RED
             title = ("Victory" if self.winner == my_team else
                      "Draw" if self.winner == -1 else "Defeat")
@@ -679,10 +706,13 @@ class ResultsScreen(MenuScreen):
         tx = x + (cw - (name_w + 2 * num_w + pad)) // 2
         self.label((tx + name_w, ty, num_w, 26), "Blue", "#blue_head")
         self.label((tx + name_w + num_w + pad, ty, num_w, 26), "Red", "#red_head")
-        for name, key in (("Kills", "kills"), ("Damage dealt", "damage"),
-                          ("Team kills", "teamkills"), ("Crashes", "env_deaths")):
+        for name, key in rows:
             ty += 30
-            d = getattr(s, key)
+            if key == "station_damage":
+                dealt = self.summary.get("station_damage", {})
+                d = {"blue": dealt.get(BLUE, 0), "red": dealt.get(RED, 0)}
+            else:
+                d = getattr(s, key)
             self.label((tx, ty, name_w, 26), name, "#stat_name")
             self.label((tx + name_w, ty, num_w, 26), str(d["blue"]), "#stat")
             self.label((tx + name_w + num_w + pad, ty, num_w, 26), str(d["red"]), "#stat")
@@ -695,14 +725,23 @@ class ResultsScreen(MenuScreen):
 
     def _how(self) -> str:
         cfg = self.match.config
+        mode = self.summary.get("mode", "deathmatch")
+        timed_out = cfg.max_frames is not None and self.frames >= cfg.max_frames
+        if mode == "survival":
+            if timed_out:
+                return "Held out until the time limit"
+            return f"Overrun during wave {self.summary.get('wave', 1)}"
         if self.winner == -1:
-            return "Out of time, even health" if self.frames >= (cfg.max_frames or 10 ** 9) else "Mutual destruction"
-        if cfg.max_frames is not None and self.frames >= cfg.max_frames:
-            return "Won on health at the time limit"
+            return "Out of time, even health" if timed_out else "Mutual destruction"
+        if timed_out:
+            return ("Won on station health at the time limit" if mode == "siege"
+                    else "Won on health at the time limit")
+        if mode == "siege":
+            return "Station destroyed and fleet wiped out"
         return "Fleet destroyed"
 
     def again(self):
-        self.app.replace(GameScreen(self.app, self.match, self.mode, self.game_index + 1))
+        self.app.replace(GameScreen(self.app, self.match, self.game_index + 1))
 
     def back(self):
         self.app.home()
@@ -743,7 +782,7 @@ class SettingsScreen(MenuScreen):
             self.choice((x + lw, y, fw, 34), on_off, getattr(s, key),
                         lambda v, k=key: self._toggle(k, v))
             y += 50
-        self.button((x, y + 10, cw, 40), "Forget saved match setups", self._forget)
+        self.button((x, y + 10, cw, 40), "Forget saved match setup", self._forget)
         path = str(self._path()).replace(os.path.expanduser("~"), "~", 1)
         if len(path) > 60:  # keep the file name visible
             path = path[:22] + "..." + path[-35:]
@@ -761,8 +800,7 @@ class SettingsScreen(MenuScreen):
         self.app.save_settings()
 
     def _forget(self):
-        self.app.settings.last_play = None
-        self.app.settings.last_watch = None
+        self.app.settings.last_setup = None
         self.app.save_settings()
 
 

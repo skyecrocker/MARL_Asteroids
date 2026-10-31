@@ -1,4 +1,4 @@
-"""Attract mode: a bot-vs-bot match running behind the menus.
+"""Attract mode: a bot-vs-bot station siege running behind the menus.
 
 Scripted bots only, so it costs almost nothing and never depends on checkpoints being present.
 The map is drawn large enough to cover the window and dimmed so widgets stay readable.
@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pygame
 
-from ..config import get_scenario
+from ..config import make_game
 from ..env import TeamAsteroidsEnv
 from ..policies import make_scripted
 from ..render import Renderer
@@ -18,7 +18,8 @@ DIM_ALPHA = 150
 class MenuBackground:
     def __init__(self, size, effects: bool = True, seed: int = 0):
         self.size = size
-        cfg = get_scenario("team3", max_frames=1500)
+        # A 3v3 station siege between bots: shows off the objective mode and restarts at the end
+        cfg = make_game("siege", "medium", 3, 3, time_limit=180.0, use_mode_time_limit=False)
         self.env = TeamAsteroidsEnv(cfg)
         self.renderer = Renderer(self.env, window=max(size), effects=effects, show_hud=False)
         self.blue = make_scripted("heuristic_1.0", seed=seed)

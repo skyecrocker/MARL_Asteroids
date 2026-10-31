@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from .config import GameConfig, get_scenario, scale_map, set_team_fire_rate
+from .config import GameConfig, get_scenario, make_game, scale_map, set_team_fire_rate
 from .env import TeamAsteroidsEnv
 from .matches import MatchStats, record_game
 from .policies import DelayedPolicy, NetworkPolicy, Policy, resolve_policy
@@ -36,8 +36,16 @@ KEEP = "scenario"  # sentinel: leave this setting as the scenario defines it
 
 @dataclass
 class MatchSpec:
-    """Everything needed to set up a game. All fields are JSON-serializable."""
+    """Everything needed to set up a game. All fields are JSON-serializable.
+
+    Two ways to describe the arena: set ``arena`` (small/medium/large/huge) and ``mode`` to build a
+    game from scratch (what the app does), or leave ``arena`` as None to start from a named
+    ``scenario`` (what the command-line scripts and evaluation suites use).
+    """
     scenario: str = "demo_team2"
+    mode: str = "deathmatch"             # see config.MODES; used when ``arena`` is set
+    arena: Optional[str] = None          # see config.ARENA_SIZES
+    fixed_spawns: bool = True            # deathmatch with ``arena``: line teams up vs. random
     # Controller per ship ("human", a scripted name such as "heuristic_1.0", or a checkpoint path).
     # Ships not listed use ``default_controller``.
     controllers: Dict[str, str] = field(default_factory=dict)
@@ -48,7 +56,7 @@ class MatchSpec:
     asteroid_density: float = 1.0        # asteroid count multiplier applied with scale
     num_asteroids: Optional[int] = None  # explicit count, applied after scaling
     asteroids_split: Optional[bool] = None
-    # Seconds, None for no time limit, or KEEP for the scenario's own limit
+    # Seconds, None for no time limit, or KEEP for the scenario's (or mode's) own limit
     time_limit: Union[float, None, str] = KEEP
     difficulty: Optional[str] = None     # None = "normal" if a human plays, else unhandicapped
     follow: str = "auto"                 # "auto" (your ship if playing), "none", or an agent name
@@ -67,7 +75,19 @@ class MatchSpec:
 
 
 def build_config(spec: MatchSpec) -> GameConfig:
-    """Apply the spec's overrides to its scenario (handicaps are applied in ``build_match``)."""
+    """Build the game config from the spec (handicaps are applied in ``build_match``)."""
+    if spec.arena is not None:
+        keep_time = spec.time_limit == KEEP
+        return make_game(
+            spec.mode, spec.arena,
+            m_blue=2 if spec.m_blue is None else int(spec.m_blue),
+            n_red=2 if spec.n_red is None else int(spec.n_red),
+            num_asteroids=spec.num_asteroids,
+            asteroids_split=True if spec.asteroids_split is None else bool(spec.asteroids_split),
+            fixed_spawns=spec.fixed_spawns,
+            time_limit=None if keep_time else spec.time_limit,
+            use_mode_time_limit=keep_time)
+
     cfg = get_scenario(spec.scenario)
     # Team sizes first, so scale_map scales the trimmed spawn lists. Extra ships spawn randomly.
     if spec.n_red is not None:

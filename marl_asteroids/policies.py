@@ -78,9 +78,18 @@ def heuristic_action(env, agent_name, rng, p: float = 1.0, danger_zone: float = 
             dx, dy, d = env.wrapped_delta(ego.pos, b.pos)
             if d < closest:
                 closest, tdx, tdy = d, dx, dy
+    stations = getattr(env, "stations", {})
+    for st in stations.values():  # solid obstacles, measured to the surface
+        if st.active:
+            dx, dy, d = env.wrapped_delta(ego.pos, st.pos)
+            if d - st.radius < closest:
+                closest, tdx, tdy = d - st.radius, dx, dy
     if closest < danger_zone:
         diff = _angle_diff(math.atan2(-tdy, -tdx), ego.angle)
         return np.array([1 if abs(diff) < 1.5 else 0, _steer(diff), 0])
+
+    if stations:
+        return _siege_attack(env, ego, agent_name, stations)
 
     best, tgt = float("inf"), None
     for name, other in env.ships.items():
@@ -92,6 +101,45 @@ def heuristic_action(env, agent_name, rng, p: float = 1.0, danger_zone: float = 
         return NOOP.copy()
     diff = _angle_diff(math.atan2(tgt[1], tgt[0]), ego.angle)
     return np.array([1 if abs(diff) < 0.5 and best > 150 else 0, _steer(diff), 1 if abs(diff) < 0.2 else 0])
+
+
+# Siege target preference, as multipliers on distance (lower = more attractive):
+PUSH = 0.75         # the enemy station is a bit more attractive than an equally distant ship
+DEFEND = 0.55       # enemies near our own station are the most urgent
+DEFEND_RADIUS = 420.0
+STANDOFF = 230.0    # px from the station surface: inside bullet range (~480), out of ramming range
+
+
+def _siege_attack(env, ego, agent_name, stations):
+    """Pick between enemy ships and the enemy station, defending home first."""
+    home = stations.get(ego.team_id)
+    enemy_team = 1 - ego.team_id
+    options = []  # (score, dx, dy, dist, is_station, radius)
+    for name, other in env.ships.items():
+        if name == agent_name or not other.active or other.team_id == ego.team_id:
+            continue
+        dx, dy, d = env.wrapped_delta(ego.pos, other.pos)
+        mult = 1.0
+        if home is not None and home.active and env._wrapped_dist(other.pos, home.pos) < DEFEND_RADIUS:
+            mult = DEFEND
+        options.append((d * mult, dx, dy, d, False, other.radius))
+    target_station = stations.get(enemy_team)
+    if target_station is not None and target_station.active:
+        dx, dy, d = env.wrapped_delta(ego.pos, target_station.pos)
+        options.append((d * PUSH, dx, dy, d, True, target_station.radius))
+    if not options:
+        return NOOP.copy()
+    _, dx, dy, d, is_station, radius = min(options, key=lambda o: o[0])
+    diff = _angle_diff(math.atan2(dy, dx), ego.angle)
+    if is_station:
+        # A big target: anything within its angular radius hits. Hold off at standoff range, and
+        # only fire when the shot can arrive (bullets fly bullet_speed * lifespan, ~480 px).
+        tol = max(0.2, math.atan2(radius * 0.8, max(d, 1.0)))
+        thrust = 1 if abs(diff) < 0.5 and d - radius > STANDOFF else 0
+        reach = env.config.bullet_speed * env.config.bullet_lifespan * 0.85
+        shoot = 1 if abs(diff) < tol and d - radius < reach else 0
+        return np.array([thrust, _steer(diff), shoot])
+    return np.array([1 if abs(diff) < 0.5 and d > 150 else 0, _steer(diff), 1 if abs(diff) < 0.2 else 0])
 
 
 def evasion_action(env, agent_name, rng, ast_only=False, shooting=False, danger_zone=150.0):
@@ -108,6 +156,11 @@ def evasion_action(env, agent_name, rng, ast_only=False, shooting=False, danger_
         dx, dy, d = env.wrapped_delta(ego.pos, pos)
         if d < closest:
             closest, tdx, tdy = d, dx, dy
+    for st in getattr(env, "stations", {}).values():
+        if st.active:
+            dx, dy, d = env.wrapped_delta(ego.pos, st.pos)
+            if d - st.radius < closest:
+                closest, tdx, tdy = d - st.radius, dx, dy
     if closest < danger_zone:
         diff = _angle_diff(math.atan2(-tdy, -tdx), ego.angle)
         return np.array([1 if abs(diff) < 1.5 else 0, _steer(diff), 0])

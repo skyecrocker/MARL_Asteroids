@@ -19,8 +19,8 @@ import gymnasium as gym
 import numpy as np
 from pettingzoo.utils.env import ParallelEnv
 
-from .config import GameConfig
-from .entities import Asteroid, Bullet, Ship
+from .config import MODES, GameConfig
+from .entities import Asteroid, Bullet, Ship, Station
 
 RED, BLUE = 0, 1
 TEAM_NAMES = ("red", "blue")
@@ -64,6 +64,13 @@ class TeamAsteroidsEnv(ParallelEnv):
         self.height = float(config.height)
         self.friendly_fire = config.friendly_fire
         self.asteroids_split = config.asteroids_split
+        if config.mode not in MODES:
+            raise ValueError(f"unknown mode {config.mode!r}; choose from {sorted(MODES)}")
+        self.mode = config.mode
+        # In respawning modes a destroyed ship is not "done": it stays in ``agents`` (with an
+        # all-zero observation) until it returns, and everyone terminates together at game end.
+        self.persistent_agents = self.mode != "deathmatch"
+        self.stations: Dict[int, Station] = {}
 
         self.possible_agents = [f"red_{i}" for i in range(self.n_red)] + \
                                [f"blue_{i}" for i in range(self.m_blue)]
@@ -105,8 +112,14 @@ class TeamAsteroidsEnv(ParallelEnv):
         self.game_over = False
         self.kill_log: List[Tuple[str, str]] = []
         self.damage_log: List[Tuple[str, str, int, bool]] = []
+        self.station_log: List[Tuple[str, int, int, bool]] = []  # (source, station team, dmg, destroyed)
+        self.station_damage = {RED: 0, BLUE: 0}  # station damage dealt BY each team
+        self.wave = 1
+        self.waves_cleared = 0
+        self._wave_timer: Optional[int] = None
         self._cumulative_rewards = {a: 0.0 for a in self.possible_agents}
 
+        self._spawn_stations()
         self._spawn_ships()
         self._spawn_asteroids()
         self.bullets = []
@@ -141,6 +154,7 @@ class TeamAsteroidsEnv(ParallelEnv):
                 if killed:
                     self.kill_log.append((source, victim))
                     ind[victim] += rcfg.death
+                    self._schedule_respawn(victim)
                 if source in self.ships:
                     if friendly:
                         ind[source] += rcfg.teamdamage * damage
@@ -150,16 +164,30 @@ class TeamAsteroidsEnv(ParallelEnv):
                         ind[source] += rcfg.damage_dealt * damage
                         if killed:
                             ind[source] += rcfg.kill
+            for source, team, damage, destroyed in self._station_events:
+                self.station_log.append((source, team, damage, destroyed))
+                defenders = self.team_agents[team]
+                for a in defenders:  # the defending team shares the loss
+                    ind[a] -= rcfg.station_damage * damage / len(defenders)
+                if source in self.ships:
+                    self.station_damage[self.team_of[source]] += damage
+                    ind[source] += rcfg.station_damage * damage
+                    if destroyed:
+                        ind[source] += rcfg.station_kill
+                if destroyed:  # no station, no more respawns
+                    for a in defenders:
+                        self.ships[a].respawn_timer = None
+            self._tick_mode()
             if self.render_mode == "human":
                 self.render()
             if self.on_frame is not None:
                 self.on_frame()
-            if self._team_alive(RED) == 0 or self._team_alive(BLUE) == 0 or self._out_of_time():
+            if self._team_out(RED) or self._team_out(BLUE) or self._out_of_time():
                 break
         self.decision_step += 1
 
-        red_alive, blue_alive = self._team_alive(RED), self._team_alive(BLUE)
-        terminated = red_alive == 0 or blue_alive == 0
+        red_out, blue_out = self._team_out(RED), self._team_out(BLUE)
+        terminated = red_out or blue_out
         truncated = (not terminated) and self._out_of_time()
         self.game_over = terminated or truncated
 
@@ -182,15 +210,12 @@ class TeamAsteroidsEnv(ParallelEnv):
             for a in members:
                 rewards_all[a] = (1 - rcfg.team_spirit) * ind[a] + rcfg.team_spirit * mean
         if self.game_over:
-            if terminated and red_alive == 0 and blue_alive > 0:
+            if terminated and red_out and not blue_out:
                 self.winner = BLUE
-            elif terminated and blue_alive == 0 and red_alive > 0:
+            elif terminated and blue_out and not red_out:
                 self.winner = RED
             elif truncated:
-                # Timeout tiebreak: the team that won the damage exchange takes it. Turns a flat
-                # zero-reward draw into a real gradient.
-                red_hp, blue_hp = self.team_hp(RED), self.team_hp(BLUE)
-                self.winner = RED if red_hp > blue_hp else (BLUE if blue_hp > red_hp else -1)
+                self.winner = self._timeout_winner()
             else:
                 self.winner = -1
             for a in self.possible_agents:
@@ -207,7 +232,9 @@ class TeamAsteroidsEnv(ParallelEnv):
         observations, rewards, terminations, truncations, infos = {}, {}, {}, {}, {}
         for agent in alive_before:
             i = self.agent_index[agent]
-            dead = not self.ships[agent].active
+            # Deathmatch: a destroyed ship is done for good. Respawning modes: nobody is done until
+            # the game ends (a destroyed ship waits, with a zero observation, to come back).
+            dead = (not self.ships[agent].active) and not self.persistent_agents
             observations[agent] = self._obs[i].copy()
             rewards[agent] = rewards_all[agent]
             terminations[agent] = dead or terminated
@@ -218,7 +245,7 @@ class TeamAsteroidsEnv(ParallelEnv):
 
         if self.game_over:
             self.agents = []
-        else:
+        elif not self.persistent_agents:
             self.agents = [a for a in alive_before if self.ships[a].active]
         return observations, rewards, terminations, truncations, infos
 
@@ -228,6 +255,68 @@ class TeamAsteroidsEnv(ParallelEnv):
 
     # --------------------------------------------------------------- spawning
 
+    def _spawn_stations(self):
+        cfg = self.config
+        self.stations = {}
+        if self.mode == "siege":
+            for team, fx in ((RED, cfg.station_x[0]), (BLUE, cfg.station_x[1])):
+                self.stations[team] = Station(self.width * fx, self.height / 2, team, cfg)
+
+    def station_slot(self, agent: str) -> Tuple[float, float, float]:
+        """(x, y, heading) where a siege ship (re)spawns: fanned out in front of its station,
+        facing the enemy station."""
+        team = self.team_of[agent]
+        st = self.stations[team]
+        enemy = self.stations[RED if team == BLUE else BLUE]
+        dx, dy, _ = self.wrapped_delta(st.pos, enemy.pos)
+        base = math.atan2(dy, dx)
+        n = len(self.team_agents[team])
+        i = int(agent.split("_")[1])
+        theta = base + (i - (n - 1) / 2) * 0.55
+        r = st.radius + self.config.ship_radius + 34.0
+        return ((st.pos[0] + math.cos(theta) * r) % self.width,
+                (st.pos[1] + math.sin(theta) * r) % self.height, base)
+
+    def _far_spawn(self) -> Tuple[float, float, float]:
+        """Survival: a point far from every living blue ship, facing the nearest one."""
+        cfg, rng = self.config, self.np_random
+        blues = [s.pos for a, s in self.ships.items() if self.team_of[a] == BLUE and s.active]
+        min_d = cfg.wave_spawn_distance * min(self.width, self.height)
+        best, best_d = None, -1.0
+        for _ in range(60):
+            x, y = rng.uniform(0, self.width), rng.uniform(0, self.height)
+            d = min((self._wrapped_dist((x, y), p) for p in blues), default=float("inf"))
+            if d >= min_d:
+                best = (x, y)
+                break
+            if d > best_d:
+                best, best_d = (x, y), d
+        x, y = best
+        if blues:
+            target = min(blues, key=lambda p: self._wrapped_dist((x, y), p))
+            dx, dy, _ = self.wrapped_delta((x, y), target)
+            heading = math.atan2(dy, dx)
+        else:
+            heading = rng.uniform(-math.pi, math.pi)
+        return x, y, heading
+
+    def wave_size(self, wave: int) -> int:
+        cfg = self.config
+        first = (self.m_blue + 1) // 2  # warm-up: blue outnumbers the first wave
+        return max(1, min(self.n_red, first + (wave - 1) * cfg.wave_growth))
+
+    def _spawn_wave(self, wave: int):
+        size = self.wave_size(wave)
+        for k, agent in enumerate(self.team_agents[RED]):
+            ship = self.ships[agent]
+            if k < size:
+                x, y, heading = self._far_spawn()
+                ship.respawn(x, y, heading, protection=self.config.spawn_protection)
+            else:
+                ship.active = False
+                ship.reserve = True
+                ship.respawn_timer = None
+
     def _spawn_ships(self):
         cfg, rng = self.config, self.np_random
         self.ships = {}
@@ -236,6 +325,21 @@ class TeamAsteroidsEnv(ParallelEnv):
             spawns = (cfg.red_spawns if team == RED else cfg.blue_spawns) or []
             idx = int(agent.split("_")[1])
             bp = spawns[idx] if idx < len(spawns) else None
+            fire_rate = bp.fire_rate if bp else None
+
+            if self.mode == "siege":
+                x, y, heading = self.station_slot(agent)
+                ship = Ship(x, y, team, agent, cfg, fire_rate=fire_rate)
+                ship.angle = heading
+                ship.protection = cfg.spawn_protection
+                self.ships[agent] = ship
+                continue
+            if self.mode == "survival" and team == RED:
+                ship = Ship(0.0, 0.0, team, agent, cfg, fire_rate=fire_rate)  # placed by _spawn_wave
+                ship.active = False
+                ship.reserve = True
+                self.ships[agent] = ship
+                continue
             # A blueprint with no randomness always proposes the same spot, so retrying is pointless.
             deterministic = bp is not None and not bp.random_spawn and bp.x_noise == 0 and bp.y_noise == 0
 
@@ -250,11 +354,13 @@ class TeamAsteroidsEnv(ParallelEnv):
                 if all(self._wrapped_dist((x, y), s.pos) >= cfg.min_spawn_dist for s in self.ships.values()):
                     break
 
-            ship = Ship(x, y, team, agent, cfg, fire_rate=bp.fire_rate if bp else None)
+            ship = Ship(x, y, team, agent, cfg, fire_rate=fire_rate)
             ship.angle = angle
             if bp is not None:
                 ship.vel[:] = (rng.normal(bp.vx, bp.vx_noise), rng.normal(bp.vy, bp.vy_noise))
             self.ships[agent] = ship
+        if self.mode == "survival":
+            self._spawn_wave(1)  # needs blue placed first, to spawn red far away from it
 
     def _spawn_asteroids(self):
         cfg, rng = self.config, self.np_random
@@ -268,7 +374,9 @@ class TeamAsteroidsEnv(ParallelEnv):
             for _attempt in range(200):
                 ax, ay = rng.uniform(0, self.width), rng.uniform(0, self.height)
                 if all(self._wrapped_dist((ax, ay), s.pos) >= cfg.asteroid_clear_radius
-                       for s in self.ships.values()):
+                       for s in self.ships.values() if s.active) and \
+                   all(self._wrapped_dist((ax, ay), st.pos) >= cfg.asteroid_clear_radius + st.radius
+                       for st in self.stations.values()):
                     break
             angle = rng.uniform(0, 2 * math.pi)
             speed = rng.uniform(*cfg.asteroid_speed_range)
@@ -359,6 +467,8 @@ class TeamAsteroidsEnv(ParallelEnv):
         weapon fire, or "asteroid"/"ram" for environmental damage.
         """
         events: List[Tuple[str, str, int, bool]] = []
+        station_events: List[Tuple[str, int, int, bool]] = []
+        self._station_events = station_events  # read by step()
         cfg = self.config
         new_asteroids = []
 
@@ -381,6 +491,21 @@ class TeamAsteroidsEnv(ParallelEnv):
                     b.active = False
                     hit(b.owner_name, name, cfg.bullet_damage)
                     break
+
+        # Bullets vs stations: enemy fire damages a station; a team's own fire passes through it
+        if self.stations:
+            for b in self.bullets:
+                if not b.active:
+                    continue
+                for team, st in self.stations.items():
+                    if not st.active or b.team_id == team:
+                        continue
+                    if self._wrapped_dist(b.pos, st.pos) < b.radius + st.radius:
+                        b.active = False
+                        dealt = st.apply_damage(cfg.bullet_damage)
+                        if dealt:
+                            station_events.append((b.owner_name, team, dealt, not st.active))
+                        break
 
         # Bullets vs asteroids
         for b in self.bullets:
@@ -443,6 +568,29 @@ class TeamAsteroidsEnv(ParallelEnv):
                         hit("ram", nb, cfg.ram_damage)
                     break
 
+        # Stations are solid: ships bounce off (ramming an enemy station hurts the ship, never the
+        # station) and asteroids bounce off.
+        for team, st in self.stations.items():
+            if not st.active:
+                continue
+            for name, ship in self.ships.items():
+                if not ship.active:
+                    continue
+                dx, dy, dist = self.wrapped_delta(ship.pos, st.pos)
+                overlap = ship.radius + st.radius
+                if dist < overlap:
+                    self._separate(ship, (dx, dy), dist, overlap, push_both=False)
+                    if ship.team_id != team and ship.collision_cooldown <= 0:
+                        ship.collision_cooldown = cfg.collision_damage_cooldown
+                        hit("ram", name, cfg.ram_damage)
+            for ast in self.asteroids:
+                if not ast.active:
+                    continue
+                dx, dy, dist = self.wrapped_delta(ast.pos, st.pos)
+                overlap = ast.radius + st.radius
+                if dist < overlap:
+                    self._separate(ast, (dx, dy), dist, overlap, push_both=False)
+
         if self.asteroids_split:
             self.asteroids = [a for a in self.asteroids if a.active] + new_asteroids
         return events
@@ -470,6 +618,104 @@ class TeamAsteroidsEnv(ParallelEnv):
 
     def _team_alive(self, team: int) -> int:
         return sum(1 for a in self.team_agents[team] if self.ships[a].active)
+
+    def _team_out(self, team: int) -> bool:
+        """Has this team lost every way to keep playing?"""
+        if self._team_alive(team) > 0:
+            return False
+        if self.mode == "siege":
+            # Ships waiting to respawn keep the team in the game; a living station always will
+            st = self.stations[team]
+            return not st.active and not any(self.ships[a].respawn_timer is not None
+                                             for a in self.team_agents[team])
+        if self.mode == "survival" and team == RED:
+            return False  # red is the endless enemy: clearing a wave just brings the next one
+        return True
+
+    def _schedule_respawn(self, agent: str):
+        ship = self.ships[agent]
+        if self.mode == "siege" and self.stations[self.team_of[agent]].active:
+            ship.respawn_timer = self.config.respawn_delay
+
+    def _tick_mode(self):
+        """Per-frame rules for respawning modes: station regen, respawn countdowns, waves."""
+        cfg = self.config
+        for st in self.stations.values():
+            st.tick()
+        if self.mode == "siege":
+            for agent, ship in self.ships.items():
+                if ship.active:
+                    continue
+                if ship.respawn_timer is None:
+                    # However the ship was destroyed, it comes back while its station stands.
+                    # (Once the station falls its pending respawns are cleared and this stays off.)
+                    self._schedule_respawn(agent)
+                    if ship.respawn_timer is None:
+                        continue
+                ship.respawn_timer -= 1
+                if ship.respawn_timer <= 0:
+                    x, y, heading = self.station_slot(agent)
+                    ship.respawn(x, y, heading, protection=cfg.spawn_protection)
+        elif self.mode == "survival":
+            if self._wave_timer is None:
+                if self._team_alive(RED) == 0 and self._team_alive(BLUE) > 0:
+                    # Wave cleared: fallen allies return and everyone is repaired
+                    self.waves_cleared += 1
+                    self._wave_timer = cfg.wave_delay
+                    for agent in self.team_agents[BLUE]:
+                        ship = self.ships[agent]
+                        if ship.active:
+                            ship.hull = ship.max_hull
+                        else:
+                            x, y, heading = self._near_ally_spawn()
+                            ship.respawn(x, y, heading, protection=cfg.spawn_protection)
+            else:
+                self._wave_timer -= 1
+                if self._wave_timer <= 0:
+                    self._wave_timer = None
+                    self.wave += 1
+                    self._spawn_wave(self.wave)
+
+    def _near_ally_spawn(self) -> Tuple[float, float, float]:
+        """Survival: return a fallen blue ship next to a living teammate (or the map center)."""
+        blues = [s for a, s in self.ships.items() if self.team_of[a] == BLUE and s.active]
+        anchor = blues[0].pos if blues else np.array([self.width / 2, self.height / 2])
+        a = self.np_random.uniform(-math.pi, math.pi)
+        d = 3 * self.config.ship_radius + 20
+        return ((anchor[0] + math.cos(a) * d) % self.width,
+                (anchor[1] + math.sin(a) * d) % self.height, -math.pi / 2)
+
+    @property
+    def wave_cooldown(self) -> Optional[int]:
+        """Frames until the next survival wave, or None while a wave is in progress."""
+        return self._wave_timer
+
+    def summary(self) -> dict:
+        """Mode-specific outcome details for results screens."""
+        out = {"mode": self.mode}
+        if self.mode == "siege":
+            out["stations"] = {team: {"hp": st.hp, "max_hp": st.max_hp, "alive": st.active}
+                               for team, st in self.stations.items()}
+            out["station_damage"] = dict(self.station_damage)
+        elif self.mode == "survival":
+            out["waves_cleared"] = self.waves_cleared
+            out["wave"] = self.wave
+        return out
+
+    def _timeout_winner(self) -> int:
+        """Who takes a game that ran out of time.
+
+        Survival: blue, for holding out. Siege: the healthier station (as a fraction), then the
+        healthier fleet. Deathmatch: the healthier fleet. The tiebreak turns a flat zero-reward draw
+        into a real gradient for training."""
+        if self.mode == "survival":
+            return BLUE
+        if self.mode == "siege":
+            r, b = self.stations[RED].health_fraction, self.stations[BLUE].health_fraction
+            if abs(r - b) > 1e-9:
+                return RED if r > b else BLUE
+        red_hp, blue_hp = self.team_hp(RED), self.team_hp(BLUE)
+        return RED if red_hp > blue_hp else (BLUE if blue_hp > red_hp else -1)
 
     def team_hp(self, team: int) -> int:
         """Total remaining hull + shield across a team (used for the timeout tiebreak)."""

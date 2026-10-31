@@ -212,5 +212,18 @@
     "misc": {
       "text_horiz_alignment": "right"
     }
+  },
+  "#mode_blurb": {
+    "font": {
+      "name": "noto_sans",
+      "size": "14"
+    },
+    "colours": {
+      "dark_bg": "#00000000",
+      "normal_border": "#00000000"
+    },
+    "misc": {
+      "border_width": "0"
+    }
   }
 }

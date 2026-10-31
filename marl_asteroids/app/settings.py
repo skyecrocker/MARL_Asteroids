@@ -1,4 +1,4 @@
-"""Persisted app preferences and the last match setups.
+"""Persisted app preferences and the last match setup.
 
 Stored as JSON in ``$MARL_ASTEROIDS_CONFIG`` if set, otherwise
 ``$XDG_CONFIG_HOME/marl-asteroids/app.json`` (``~/.config/...`` by default). Loading never fails:
@@ -32,8 +32,7 @@ class AppSettings:
     minimap: bool = True
     show_obs: bool = False        # observation overlay on by default (Tab toggles in game)
     attract_mode: bool = True     # live AI match playing behind the main menu
-    last_play: Optional[dict] = None   # MatchSpec.to_dict() of the last "Play" setup
-    last_watch: Optional[dict] = None  # ... and of the last "Watch" setup
+    last_setup: Optional[dict] = None  # MatchSpec.to_dict() of the last match started
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "AppSettings":

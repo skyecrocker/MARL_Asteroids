@@ -16,13 +16,19 @@ import time
 
 import pygame
 
-from marl_asteroids.config import SCENARIOS
+from marl_asteroids.config import ARENA_SIZES, MODES, SCENARIOS
 from marl_asteroids.session import DIFFICULTY, MatchSpec, agent_names, build_config, build_match
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scenario", default="demo_team2", choices=sorted(SCENARIOS))
+    ap.add_argument("--scenario", default="demo_team2", choices=sorted(SCENARIOS),
+                    help="Named scenario (ignored when --mode or --arena is given)")
+    ap.add_argument("--mode", choices=sorted(MODES), default=None,
+                    help="Build the game from a mode and arena size instead of a scenario")
+    ap.add_argument("--arena", choices=list(ARENA_SIZES), default=None)
+    ap.add_argument("--blue-ships", type=int, default=2, help="With --mode/--arena")
+    ap.add_argument("--red-ships", type=int, default=2, help="With --mode/--arena")
     ap.add_argument("--blue", default="heuristic_1.0",
                     help="scripted name, 'human', or checkpoint path. Comma-separated assigns per "
                          "ship, e.g. 'human,heuristic_1.0' to fly with an AI wingman")
@@ -55,6 +61,10 @@ def main():
     spec = MatchSpec(scenario=args.scenario, scale=args.scale, asteroid_density=args.asteroid_density,
                      difficulty=args.difficulty, follow=args.follow, view=args.view,
                      stochastic=args.stochastic, seed=args.seed)
+    if args.mode or args.arena:
+        spec.mode = args.mode or "deathmatch"
+        spec.arena = args.arena or "medium"
+        spec.m_blue, spec.n_red = args.blue_ships, args.red_ships
     # Per-ship controllers: a single value applies to the whole team; a comma-separated list
     # assigns per ship (cycled), e.g. --blue human,heuristic_1.0 puts you in blue_0 with a wingman.
     for agent in agent_names(build_config(spec)):

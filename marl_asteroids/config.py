@@ -4,7 +4,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 GAME_WIDTH = 800.0
 GAME_HEIGHT = 800.0
@@ -55,6 +55,11 @@ class RewardConfig:
     damage_dealt: float = 0.15
     damage_taken: float = -0.15
     teamdamage: float = -0.15  # Applied to the shooter for friendly-fire damage
+
+    # Station siege: the shooter is paid per point of station damage; the defending team shares the
+    # same amount as a penalty. Destroying a station pays the shooter ``station_kill``.
+    station_damage: float = 0.05
+    station_kill: float = 1.0
 
     # Potential-based shaping F = gamma * phi(s') - phi(s); preserves the optimal policy.
     shaping_scale: float = 0.1
@@ -130,6 +135,34 @@ class GameConfig:
     # never double-hit).
     collision_damage_cooldown: int = 45
     bounce_restitution: float = 0.85
+
+    # Game mode (see MODES): "deathmatch", "siege" or "survival"
+    mode: str = "deathmatch"
+    respawn_delay: int = 180        # Frames a destroyed ship waits before respawning
+    spawn_protection: int = 90      # Frames of invulnerability after (re)spawning
+
+    # Station siege. Each team has a station; ships respawn at it while it stands. Its shield
+    # regenerates continuously (not after a quiet period like ships), and the regen also soaks hull
+    # damage, so a station only takes damage faster than regen * time. The rate sits between one and
+    # two ships' *realistic* output: a ship fires at most 60/fire_rate = 2 shots/s but lands far
+    # fewer while maneuvering, so 1.6/s leaves a lone attacker needing over a minute uncontested,
+    # while two or three wear a station down in roughly 20 s / 10 s. (A first tuning at 2.2/s with
+    # 12 shield and 24 hull stalemated every bot game: stations never dropped below 90%.)
+    station_radius: float = 38.0
+    station_hull: int = 16
+    station_shield: int = 10
+    station_shield_regen: float = 1.6  # shield points per second
+    # Stations sit half a map apart, the farthest two points can be on a torus, so neither the
+    # direct path nor the wrap-around path between them is shorter.
+    station_x: Tuple[float, float] = (0.25, 0.75)  # (red, blue) as fractions of the map width
+
+    # Survival. Blue faces waves of red. Wave k has min(n_red, ceil(m_blue / 2) + (k - 1) *
+    # wave_growth) ships, so the first wave is a warm-up where blue outnumbers red, and n_red caps
+    # the wave size. When a wave is cleared, fallen blue ships respawn and all blue hulls are
+    # repaired.
+    wave_growth: int = 1
+    wave_delay: int = 150           # Frames between clearing a wave and the next one arriving
+    wave_spawn_distance: float = 0.35  # New enemies appear at least this fraction of the map away
 
     # Episode. ``max_frames=None`` means no truncation at all (used by the demo scenarios so a
     # human game never ends on a clock). Training scenarios must keep a limit.
@@ -285,6 +318,65 @@ SCENARIOS.update({
     # asteroid_density=0 keeps exactly the 4 placed rocks, so the layout stays fully deterministic.
     "demo_team2_large": scale_map(SCENARIOS["demo_team2"], 2.0, asteroid_density=0.0),  # 2400x2400
 })
+
+# ---------------------------------------------------------------------------
+# Modes and arenas (what the app builds games from)
+# ---------------------------------------------------------------------------
+
+MODES: Dict[str, str] = {
+    "deathmatch": "Destroy every enemy ship. No respawns.",
+    "siege": "Ships respawn while their station stands. Destroy the enemy station, then their "
+             "fleet. A lone ship can't break a station's shield.",
+    "survival": "Blue holds out against growing waves of red. Fallen allies return between waves.",
+}
+MODE_NAMES: Dict[str, str] = {"deathmatch": "Deathmatch", "siege": "Station siege",
+                              "survival": "Survival"}
+# Default time limit per mode in seconds (None = no limit). Siege can stall if both teams turtle,
+# so it gets a clock; the station with more health wins the timeout.
+MODE_TIME_LIMIT: Dict[str, Optional[float]] = {"deathmatch": None, "siege": 300.0, "survival": None}
+
+ARENA_SIZES: Dict[str, float] = {"small": 800.0, "medium": 1200.0, "large": 1600.0, "huge": 2400.0}
+ARENA_ASTEROIDS: Dict[str, int] = {"small": 3, "medium": 5, "large": 8, "huge": 14}
+
+
+def make_game(mode: str = "deathmatch", arena: str = "medium", m_blue: int = 2, n_red: int = 2,
+              num_asteroids: Optional[int] = None, asteroids_split: bool = True,
+              fixed_spawns: bool = True, time_limit: Optional[float] = None,
+              use_mode_time_limit: bool = True) -> GameConfig:
+    """Build a game from the handful of choices the app exposes.
+
+    Physics are the defaults the agents were trained on, so trained models play every arena.
+    ``fixed_spawns`` (deathmatch only) lines the teams up facing each other's flank; otherwise ships
+    spawn at random. Siege ships always spawn at their station, and survival puts blue in the middle
+    with red waves arriving from far away. Asteroids are always placed at random.
+    """
+    if mode not in MODES:
+        raise ValueError(f"unknown mode {mode!r}; choose from {sorted(MODES)}")
+    if arena not in ARENA_SIZES:
+        raise ValueError(f"unknown arena size {arena!r}; choose from {list(ARENA_SIZES)}")
+    if m_blue < 1 or n_red < 1:
+        raise ValueError("each team needs at least one ship")
+    size = ARENA_SIZES[arena]
+    if use_mode_time_limit:
+        time_limit = MODE_TIME_LIMIT[mode]
+    cfg = GameConfig(
+        mode=mode, width=size, height=size, m_blue=m_blue, n_red=n_red,
+        num_asteroids=ARENA_ASTEROIDS[arena] if num_asteroids is None else max(0, num_asteroids),
+        asteroids_split=asteroids_split,
+        max_frames=None if time_limit is None else max(1, int(time_limit * 60)),
+        # Spawning ships 150 px apart is fine on a small map but too close to react on a big one
+        min_spawn_dist=max(150.0, size * 0.15),
+    )
+    if mode == "deathmatch" and fixed_spawns:
+        def formation(n, x, facing):
+            spacing = min(320.0, size * 0.75 / max(1, n))
+            return _line_formation(n, x, size / 2, spacing, facing)
+        cfg.red_spawns = formation(n_red, size * 0.3, math.pi / 2)
+        cfg.blue_spawns = formation(m_blue, size * 0.7, -math.pi / 2)
+    elif mode == "survival":
+        cfg.blue_spawns = _line_formation(m_blue, size / 2, size / 2, 90.0, -math.pi / 2)
+    return cfg
+
 
 # Evaluation suite mirroring the legacy report's levels 1-4.
 EVAL_SCENARIOS: Dict[str, str] = {

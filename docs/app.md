@@ -1,4 +1,4 @@
-# Desktop app design (v1)
+# Desktop app design
 
 A single pygame window for playing and watching, so nothing has to be run from the command line except
 training. Scripts (`train.py`, `evaluate.py`, `league.py`, `watch.py`) keep working unchanged.
@@ -13,7 +13,8 @@ training. Scripts (`train.py`, `evaluate.py`, `league.py`, `watch.py`) keep work
 
 ```
 marl_asteroids/
-  session.py      MatchSpec (plain data: scenario, overrides, per-ship controllers, camera...)
+  session.py      MatchSpec (plain data: mode + arena size, or a named scenario; per-ship
+                  controllers, camera...)
                   -> build_match() -> Match (config, env, policies, renderer settings)
                   Shared by the app and scripts/watch.py, so both build games the same way.
   checkpoints.py  Finds models under models/, keeps only those whose observation size matches
@@ -35,17 +36,20 @@ Two refactors make this possible:
 
 ## Screens
 
-- **Main menu:** Play, Watch, Gallery, Settings, Quit.
-- **Match setup:** scenario, ships per team, map scale, asteroid count, splitting, time limit, a
-  controller per ship (you, a trained model, or a scripted bot), difficulty, camera. Play defaults
-  to you flying `blue_0`; Watch defaults to AI on both sides. The last setup is remembered.
+- **Main menu:** Play, Gallery, Settings, Quit. (Watch was removed: give your ship to an AI to spectate.)
+- **Match setup:** mode (deathmatch, station siege, survival), arena size (small/medium/large/huge),
+  ships per team, spawns (deathmatch only), asteroid count, splitting, time limit, a controller per
+  ship (you, a trained model, or a scripted bot), difficulty, camera. Defaults to you flying
+  `blue_0` in a 2v2 deathmatch. Switching to an objective mode swaps trained agents for the
+  objective-aware bot, since the agents only know deathmatch. The last setup is remembered.
 - **Game:** `Esc` pauses (resume / restart / quit to menu), `Tab` toggles the observation overlay.
-- **Results:** winner, duration, kills, damage, team kills. Play again, change setup, or menu.
+- **Results:** winner (or waves survived), how it ended, kills, damage, station damage (siege),
+  team kills, crashes. Play again, change setup, or menu.
 - **Settings:** window size, visual effects, minimap, observation overlay default, frame rate.
 - **Gallery:** placeholder listing planned MARL exhibits.
 
-Menus run a dimmed bot-vs-bot match in the background (scripted bots only, so it never needs
-checkpoints); it can be turned off in Settings.
+Menus run a dimmed bot-vs-bot station siege in the background (scripted bots only, so it never
+needs checkpoints); it can be turned off in Settings.
 
 ## Rules
 
