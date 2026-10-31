@@ -337,6 +337,8 @@ MODE_NAMES: Dict[str, str] = {"deathmatch": "Deathmatch", "sudden_death": "Sudde
 # ends); siege gets one because it can stall if both teams turtle (healthier station wins).
 MODE_TIME_LIMIT: Dict[str, Optional[float]] = {"deathmatch": 300.0, "sudden_death": None,
                                                "siege": 300.0, "survival": None}
+MAX_TEAM_SIZE = 8          # ships per team the app offers
+SURVIVAL_MAX_ENEMIES = 20  # enemy pool in survival: waves grow by one each until this many at once
 # Modes where destroyed ships come back. In these the env keeps every agent until the game ends.
 RESPAWN_MODES = ("deathmatch", "siege", "survival")
 
@@ -380,7 +382,8 @@ def make_game(mode: str = "deathmatch", arena: str = "small", m_blue: int = 2, n
         cfg.red_spawns = formation(n_red, size * 0.3, math.pi / 2)
         cfg.blue_spawns = formation(m_blue, size * 0.7, -math.pi / 2)
     elif mode == "survival":
-        cfg.blue_spawns = _line_formation(m_blue, size / 2, size / 2, 90.0, -math.pi / 2)
+        spacing = min(90.0, size * 0.6 / max(1, m_blue))  # never wider than the map
+        cfg.blue_spawns = _line_formation(m_blue, size / 2, size / 2, spacing, -math.pi / 2)
     return cfg
 
 

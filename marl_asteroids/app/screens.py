@@ -11,7 +11,7 @@ from pygame_gui.elements import (UIButton, UIDropDownMenu, UIHorizontalSlider, U
                                  UITextBox)
 
 from ..checkpoints import discover
-from ..config import ARENA_SIZES, MODE_NAMES, MODE_TIME_LIMIT, MODES
+from ..config import ARENA_SIZES, MAX_TEAM_SIZE, MODE_NAMES, MODE_TIME_LIMIT, MODES
 from ..render import TEAM_COLORS, Renderer
 from ..env import BLUE, RED
 from ..session import DIFFICULTY, HUMAN, KEEP, PHYSICS_FPS, MatchSpec, agent_names, build_config, build_match
@@ -39,7 +39,7 @@ SCRIPTED = [
 DIFFICULTY_OPTIONS = [("Easy", "easy"), ("Normal", "normal"), ("Hard", "hard"),
                       ("Brutal (no handicap)", "brutal")]
 VIEW_OPTIONS = [("Close", 800.0), ("Medium", 1200.0), ("Wide", 1800.0)]
-TEAM_SIZE_OPTIONS = [(str(n), n) for n in range(1, 5)]
+TEAM_SIZE_OPTIONS = [(str(n), n) for n in range(1, MAX_TEAM_SIZE + 1)]
 TIME_OPTIONS = [("No limit", None), ("1 minute", 60.0), ("2 minutes", 120.0),
                 ("3 minutes", 180.0), ("5 minutes", 300.0)]
 ROCK_OPTIONS = [("Split when shot", True), ("Solid (cover)", False)]
@@ -242,7 +242,7 @@ def sanitize(spec: MatchSpec) -> MatchSpec:
         return default_spec()
     for side in ("m_blue", "n_red"):
         value = getattr(spec, side)
-        if not isinstance(value, int) or not 1 <= value <= 4:
+        if not isinstance(value, int) or not 1 <= value <= MAX_TEAM_SIZE:
             setattr(spec, side, 2)
     if not valid_controller(spec.default_controller):
         spec.default_controller = best_model(0) if spec.mode in COMBAT_MODES else BOT
@@ -274,10 +274,25 @@ class SetupScreen(MenuScreen):
         return build_config(self.spec)
 
     def _sync_controllers(self):
-        """Keep exactly one controller per ship; new ships get the default AI."""
+        """Keep exactly one controller per ship; new ships get the default AI. In survival every
+        enemy shares one controller (set with the Enemies dropdown), and you can't be one."""
         agents = agent_names(self._cfg())
         self.spec.controllers = {a: self.spec.controllers.get(a, self.spec.default_controller)
                                  for a in agents}
+        if self.spec.mode == "survival":
+            enemy = self.spec.controllers.get("red_0", BOT)
+            if enemy == HUMAN:
+                enemy = BOT
+            for a in agents:
+                if a.startswith("red"):
+                    self.spec.controllers[a] = enemy
+
+    def _set_enemies(self, controller):
+        for a in self.spec.controllers:
+            if a.startswith("red"):
+                self.spec.controllers[a] = controller
+        self.status = ""
+        self.rebuild()
 
     def _set(self, field, value, rebuild=False):
         setattr(self.spec, field, value)
@@ -304,6 +319,7 @@ class SetupScreen(MenuScreen):
             if swapped:
                 self.status = ("Trained agents only know combat modes, so AI ships now use "
                                "bots. You can still pick them.")
+        self._sync_controllers()  # survival brings its enemy pool; other modes trim back
         self.rebuild()
 
     def _set_arena(self, arena):
@@ -355,9 +371,9 @@ class SetupScreen(MenuScreen):
         self.choice(row("Arena size"), ARENA_OPTIONS, self.spec.arena, self._set_arena)
         self.choice(row("Blue ships"), TEAM_SIZE_OPTIONS, cfg.m_blue,
                     lambda v: self._set("m_blue", v, rebuild=True))
-        red_label = "Max per wave" if mode == "survival" else "Red ships"
-        self.choice(row(red_label), TEAM_SIZE_OPTIONS, cfg.n_red,
-                    lambda v: self._set("n_red", v, rebuild=True))
+        if mode != "survival":  # survival waves size themselves
+            self.choice(row("Red ships"), TEAM_SIZE_OPTIONS, cfg.n_red,
+                        lambda v: self._set("n_red", v, rebuild=True))
         if mode in COMBAT_MODES:
             self.choice(row("Spawns"), SPAWN_OPTIONS, self.spec.fixed_spawns,
                         lambda v: self._set("fixed_spawns", v))
@@ -378,20 +394,50 @@ class SetupScreen(MenuScreen):
         self.preview = self.label((x, y + 4, card_w - 40, 26), "", "#hint")
         self._refresh_preview()
 
-        # Right: ships. Rows tighten so up to 4v4 plus the 3 settings rows and hint fit the card.
+        # Right: ships. Up to 8 rows in one column (labels left, dropdowns right); beyond that,
+        # blue and red side by side. Survival enemies share a single dropdown.
         x, y = right.x + 20, right.y + 16
         self.label((x, y, 300, 30), "Ships", "#heading")
         y += 42
         options = controller_options()
         ships = agent_names(cfg)
+        blues = [a for a in ships if a.startswith("blue")]
+        reds = [] if mode == "survival" else [a for a in ships if a.startswith("red")]
+        # (label, agent or None for the survival Enemies row)
+        left_rows = [(ship_label(a), a) for a in blues]
+        right_rows = [(ship_label(a), a) for a in reds]
+        if mode == "survival":
+            right_rows.append(("Enemies", None))
         room = right.bottom - y - 3 * self.ROW - 56
-        ship_row = max(36, min(self.ROW, room // max(1, len(ships))))
-        for agent in ships:
-            oid = "#blue_label" if agent.startswith("blue") else "#red_label"
-            self.label((x, y, lw, 32), ship_label(agent), oid)
-            self.choice((x + lw, y, cw, 32), options, self.spec.controllers[agent],
-                        lambda v, a=agent: self._set_controller(a, v))
-            y += ship_row
+        enemy_opts = [o for o in options if o[1] != HUMAN]
+
+        def ship_choice(rect, agent):
+            if agent is None:
+                self.choice(rect, enemy_opts, self.spec.controllers["red_0"], self._set_enemies)
+            else:
+                self.choice(rect, options, self.spec.controllers[agent],
+                            lambda v, a=agent: self._set_controller(a, v))
+
+        if len(left_rows) + len(right_rows) <= 8:
+            rows = left_rows + right_rows
+            ship_row = max(36, min(self.ROW, room // max(1, len(rows))))
+            for text, agent in rows:
+                oid = "#blue_label" if agent and agent.startswith("blue") else "#red_label"
+                self.label((x, y, lw, 32), text, oid)
+                ship_choice((x + lw, y, cw, 32), agent)
+                y += ship_row
+        else:
+            col_w = (card_w - 40 - 20) // 2
+            slw = 74 if right_rows and right_rows[-1][1] is None else 64
+            n = max(len(left_rows), len(right_rows))
+            ship_row = max(36, min(self.ROW, room // n))
+            for col, rows in enumerate((left_rows, right_rows)):
+                cx = x + col * (col_w + 20)
+                for i, (text, agent) in enumerate(rows):
+                    oid = "#blue_label" if agent and agent.startswith("blue") else "#red_label"
+                    self.label((cx, y + i * ship_row, slw, 32), text, oid)
+                    ship_choice((cx + slw, y + i * ship_row, col_w - slw, 32), agent)
+            y += n * ship_row
         y += 8
         humans = [a for a, c in self.spec.controllers.items() if c == HUMAN]
         diff = self.spec.difficulty or "normal"
@@ -400,7 +446,7 @@ class SetupScreen(MenuScreen):
                     lambda v: self._set("difficulty", v))
         y += self.ROW
         cam_opts = [("Auto" + (" (your ship)" if humans else " (whole map)"), "auto"),
-                    ("Whole map", "none")] + [(f"Follow {ship_label(a)}", a) for a in ships]
+                    ("Whole map", "none")] + [(f"Follow {ship_label(a)}", a) for a in blues + reds]
         follow = self.spec.follow if any(v == self.spec.follow for _, v in cam_opts) else "auto"
         self.label((x, y, lw, 34), "Camera")
         self.choice((x + lw, y, cw, 34), cam_opts, follow, lambda v: self._set("follow", v))
@@ -634,31 +680,41 @@ class GameScreen(MenuScreen):
             surface.blit(self.font.render(f"{wave}  ·  cleared {env.waves_cleared}", True, col),
                          (rect.x, y))
             y += 28
-        for agent in env.team_agents[team]:
+        hints = ["Esc  pause", "Tab  sensor view"]
+        if team == BLUE and self.match.human_agents:
+            hints = ["W / Up     thrust", "A D / arrows turn", "Space      shoot"] + hints
+        shown = [a for a in env.team_agents[team] if not env.ships[a].reserve]  # skip idle wave slots
+        avail = rect.bottom - 20 * len(hints) - 10 - y
+        # Full rows (name, controller, pips) while they fit; then one line per ship; then truncate
+        row_h = 62 if len(shown) * 62 <= avail else 22
+        fit = max(1, avail // row_h)
+        overflow = len(shown) - fit if len(shown) > fit else 0
+        if overflow:
+            shown = shown[:fit - 1]
+        for agent in shown:
             ship = env.ships[agent]
-            if ship.reserve:  # survival ships not in the current wave
-                continue
             who = self.who[agent]
             if not ship.active and ship.respawn_timer is not None:
                 who = f"respawn in {ship.respawn_timer / 60:.1f}s"
             color = col if ship.active else (90, 96, 112)
             surface.blit(self.font.render(ship_label(agent), True, color), (rect.x, y))
-            surface.blit(self.font.render(who[:max(8, rect.width // 9)], True, (150, 160, 182)),
-                         (rect.x, y + 18))
-            # hull + shield pips
-            px = rect.x
-            for i in range(ship.max_hp):
+            if row_h == 62:
+                surface.blit(self.font.render(who[:max(8, rect.width // 9)], True, (150, 160, 182)),
+                             (rect.x, y + 18))
+                pip_x, pip_y = rect.x, y + 40
+            else:  # compact: pips on the name line
+                pip_x, pip_y = rect.x + 72, y + 6
+            for i in range(ship.max_hp):  # hull + shield pips
                 if i < ship.max_hull:
                     on = i < ship.hull
                     c = ((120, 230, 140) if ship.hull > 1 else (255, 120, 110)) if on else (56, 40, 44)
                 else:
                     c = (110, 220, 255) if (i - ship.max_hull) < ship.shield else (34, 48, 62)
-                pygame.draw.rect(surface, c if ship.active else (40, 42, 50), (px, y + 40, 14, 6))
-                px += 18
-            y += 62
-        hints = ["Esc  pause", "Tab  sensor view"]
-        if team == BLUE and self.match.human_agents:
-            hints = ["W / Up     thrust", "A D / arrows turn", "Space      shoot"] + hints
+                pygame.draw.rect(surface, c if ship.active else (40, 42, 50), (pip_x, pip_y, 14, 6))
+                pip_x += 18
+            y += row_h
+        if overflow:
+            surface.blit(self.font.render(f"+ {overflow + 1} more", True, (150, 160, 182)), (rect.x, y))
         for i, line in enumerate(reversed(hints)):
             surface.blit(self.font.render(line, True, (110, 120, 145)),
                          (rect.x, rect.bottom - 20 - i * 20))
@@ -695,6 +751,8 @@ class ResultsScreen(MenuScreen):
                 ("Team kills", "teamkills"), ("Crashes", "env_deaths")]
         if mode == "siege":
             rows.insert(1, ("Station damage", "station_damage"))
+        if mode == "deathmatch":  # the score counts every enemy death, not just your shots
+            rows.insert(0, ("Score", "score"))
         # Card hugs the content: title, subtitle, header row, stat rows, buttons
         self.card((x - 30, y - 20, cw + 60, 20 + 118 + 30 * len(rows) + 56 + 46 + 30))
         if mode == "survival":
@@ -721,7 +779,10 @@ class ResultsScreen(MenuScreen):
         self.label((tx + name_w + num_w + pad, ty, num_w, 26), "Red", "#red_head")
         for name, key in rows:
             ty += 30
-            if key == "station_damage":
+            if key == "score":
+                score = self.summary.get("kills", {})
+                d = {"blue": score.get(BLUE, 0), "red": score.get(RED, 0)}
+            elif key == "station_damage":
                 dealt = self.summary.get("station_damage", {})
                 d = {"blue": dealt.get(BLUE, 0), "red": dealt.get(RED, 0)}
             else:

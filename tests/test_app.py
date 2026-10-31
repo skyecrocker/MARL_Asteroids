@@ -138,7 +138,7 @@ def test_spawns_option_only_in_combat_modes(app):
                         ("survival", False)):
         setup._set_mode(mode)
         assert ("Spawns" in texts_on(setup)) is shown, mode
-    assert "Max per wave" in texts_on(setup)
+    assert "Enemies" in texts_on(setup) and "Red ships" not in texts_on(setup)
 
 
 def test_trained_agents_stay_in_both_combat_modes(app):
@@ -195,7 +195,7 @@ def test_mode_change_keeps_team_sizes(app):
     setup = S.SetupScreen(app)
     app.push(setup)
     setup._set("n_red", 3, rebuild=True)
-    setup._set_mode("survival")
+    setup._set_mode("siege")
     assert setup.spec.n_red == 3 and set(setup.spec.controllers) == {
         "blue_0", "blue_1", "red_0", "red_1", "red_2"}
 
@@ -354,3 +354,29 @@ def test_objective_modes_play_through_to_results(app, mode):
         assert any(t.startswith("Survived") for t in texts)
     else:
         assert "Station damage" in texts
+
+
+def test_eight_ships_per_team_use_two_columns(app):
+    setup = S.SetupScreen(app)
+    app.push(setup)
+    setup._set("m_blue", 8, rebuild=True)
+    setup._set("n_red", 8, rebuild=True)
+    assert len(setup.spec.controllers) == 16
+    texts = texts_on(setup)
+    assert {"Blue 8", "Red 8"} <= texts
+    run(app, 2)
+    assert S.sanitize(MatchSpec(mode="deathmatch", arena="small", m_blue=8, n_red=8)).m_blue == 8
+    assert S.sanitize(MatchSpec(mode="deathmatch", arena="small", m_blue=9)).m_blue == 2
+
+
+def test_survival_enemies_share_one_controller(app):
+    setup = S.SetupScreen(app)
+    app.push(setup)
+    setup._set_controller("red_0", HUMAN)  # you can't be an enemy wave
+    setup._set_mode("survival")
+    reds = {c for a, c in setup.spec.controllers.items() if a.startswith("red")}
+    assert reds == {S.BOT} and len([a for a in setup.spec.controllers if a.startswith("red")]) == 20
+    setup._set_enemies("heuristic_0.5")
+    assert {c for a, c in setup.spec.controllers.items() if a.startswith("red")} == {"heuristic_0.5"}
+    setup._set_mode("deathmatch")  # back to a normal 2-ship red team
+    assert len([a for a in setup.spec.controllers if a.startswith("red")]) == 2

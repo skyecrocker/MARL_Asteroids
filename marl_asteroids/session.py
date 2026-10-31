@@ -14,7 +14,8 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from .config import GameConfig, get_scenario, make_game, scale_map, set_team_fire_rate
+from .config import (SURVIVAL_MAX_ENEMIES, GameConfig, get_scenario, make_game, scale_map,
+                     set_team_fire_rate)
 from .env import TeamAsteroidsEnv
 from .matches import MatchStats, record_game
 from .policies import DelayedPolicy, NetworkPolicy, Policy, resolve_policy
@@ -81,7 +82,9 @@ def build_config(spec: MatchSpec) -> GameConfig:
         return make_game(
             spec.mode, spec.arena,
             m_blue=2 if spec.m_blue is None else int(spec.m_blue),
-            n_red=2 if spec.n_red is None else int(spec.n_red),
+            # Survival waves keep growing, so red is always the full enemy pool
+            n_red=(SURVIVAL_MAX_ENEMIES if spec.mode == "survival"
+                   else 2 if spec.n_red is None else int(spec.n_red)),
             num_asteroids=spec.num_asteroids,
             asteroids_split=True if spec.asteroids_split is None else bool(spec.asteroids_split),
             fixed_spawns=spec.fixed_spawns,

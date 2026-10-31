@@ -114,7 +114,7 @@ class TeamAsteroidsEnv(ParallelEnv):
         self.damage_log: List[Tuple[str, str, int, bool]] = []
         self.station_log: List[Tuple[str, int, int, bool]] = []  # (source, station team, dmg, destroyed)
         self.station_damage = {RED: 0, BLUE: 0}  # station damage dealt BY each team
-        self.team_kills = {RED: 0, BLUE: 0}      # enemy ships destroyed by each team's fire
+        self.team_kills = {RED: 0, BLUE: 0}      # enemy ships destroyed, by any cause, per team
         self.wave = 1
         self.waves_cleared = 0
         self._wave_timer: Optional[int] = None
@@ -156,8 +156,9 @@ class TeamAsteroidsEnv(ParallelEnv):
                     self.kill_log.append((source, victim))
                     ind[victim] += rcfg.death
                     self._schedule_respawn(victim)
-                    if source in self.ships and not friendly:
-                        self.team_kills[self.team_of[source]] += 1
+                    # Score: every enemy ship destroyed counts for the other team, whatever did it
+                    # (enemy fire, an asteroid, a ram, or its own team's friendly fire)
+                    self.team_kills[1 - self.team_of[victim]] += 1
                 if source in self.ships:
                     if friendly:
                         ind[source] += rcfg.teamdamage * damage

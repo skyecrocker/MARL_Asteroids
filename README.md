@@ -50,7 +50,7 @@ uv run marl-asteroids
 ```
 
 The main menu has **Play**, **Gallery**, and **Settings**. Match setup picks the mode, arena size
-(Mini 600, Small 1200, Medium 2400, Large 4800), ships per team, spawns (deathmatch and sudden death), asteroid
+(Mini 600, Small 1200, Medium 2400, Large 4800), up to 8 ships per team, spawns (deathmatch and sudden death), asteroid
 count, rock type, time limit, and a controller for every ship: you, any compatible trained model
 (shown with its rating), or a scripted bot. You start in Blue 1; to just watch, give your ship to an
 AI. Your last setup is remembered.
@@ -59,10 +59,10 @@ AI. Your last setup is remembered.
 
 | Mode | Rules |
 |---|---|
-| **Deathmatch** | Destroyed ships respawn after 3 s, at a random spot away from the enemy, with 1.5 s of spawn protection. Score is enemy ships destroyed by your team's fire (team kills and crashes count for nobody). Most kills when time runs out wins; level scores draw. Always has a clock (default 5 min). |
+| **Deathmatch** | Destroyed ships respawn after 3 s, at a random spot away from the enemy, with 1.5 s of spawn protection. Every enemy ship destroyed scores for your team, whatever destroyed it: your fire, an asteroid, a ram, or their own friendly fire. Most kills when time runs out wins; level scores draw. Always has a clock (default 5 min). |
 | **Sudden death** | No respawns. The last team with ships left wins. (What the trained agents were trained on, and what every named scenario uses.) |
 | **Station siege** | Each team has a station. Destroyed ships respawn at it after 3 s, with 1.5 s of spawn protection. Destroy the enemy station to stop their respawns, then wipe out the fleet. Default limit 5 min; the station with more health wins a timeout. |
-| **Survival** | Blue against growing waves of red. The first wave is half blue's size; each wave adds a ship, up to the red team size. Clearing a wave brings fallen blue ships back and repairs every hull. Lasting until a time limit counts as a win. |
+| **Survival** | Blue against growing waves of red. The first wave is half blue's size; each wave adds one more enemy, up to 20 on screen at once. One Enemies dropdown sets the AI for every wave. Clearing a wave brings fallen blue ships back and repairs every hull. Lasting until a time limit counts as a win. |
 
 A station's shield regenerates continuously at 1.6 points/s, between one and two ships' damage
 output, so a lone attacker barely dents it while two or three take it down in 10-25 s

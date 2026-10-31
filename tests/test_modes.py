@@ -430,13 +430,19 @@ def test_deathmatch_level_on_kills_is_a_draw():
     assert env.winner == -1
 
 
-def test_team_kills_and_crashes_do_not_score():
+def test_every_enemy_death_scores_including_team_kills_and_crashes():
     env = env_for("deathmatch", arena="small", max_frames=60 * 5)
-    kill(env, "blue_1", "blue_0")              # friendly fire
-    env.ships["red_0"].protection = 0
-    env.ships["red_0"].apply_damage(99)        # destroyed by something other than enemy fire
-    idle(env)
-    assert env.team_kills == {RED: 0, BLUE: 0}
+    kill(env, "blue_1", "blue_0")              # blue friendly fire: a point for red
+    assert env.team_kills == {RED: 1, BLUE: 0}
+    cfg = env.config
+    rock_env = TeamAsteroidsEnv(make_game("deathmatch", "small", 1, 1, num_asteroids=1))
+    rock_env.reset(seed=0)
+    ship, rock = rock_env.ships["red_0"], rock_env.asteroids[0]
+    ship.protection = 0
+    ship.apply_damage(ship.hp - 1)
+    ship.pos[:] = rock.pos - (rock.radius + ship.radius - 3, 0)
+    idle(rock_env)                             # red crashes into a rock: a point for blue
+    assert not ship.active and rock_env.team_kills == {RED: 0, BLUE: 1}
 
 
 def test_sudden_death_has_no_respawns_and_ends_on_elimination():
@@ -502,3 +508,35 @@ def test_modes_render(mode, follow):
         assert r.render("surface").get_size()[0] == 300
     env.ships["blue_0"].apply_damage(99)  # followed ship down: HUD shows the respawn message
     r.render("surface")
+
+
+# ------------------------------------------------------------------- bigger teams and waves
+
+
+def test_survival_waves_keep_growing_in_the_app():
+    from marl_asteroids.config import SURVIVAL_MAX_ENEMIES
+    from marl_asteroids.session import MatchSpec, build_config
+    cfg = build_config(MatchSpec(mode="survival", arena="small", m_blue=2, n_red=3))
+    assert cfg.n_red == SURVIVAL_MAX_ENEMIES  # the red-ships setting no longer caps waves
+    env = TeamAsteroidsEnv(cfg)
+    env.reset(seed=0)
+    sizes = [env.wave_size(k) for k in range(1, 25)]
+    assert sizes[:5] == [1, 2, 3, 4, 5]
+    assert all(b == a + 1 for a, b in zip(sizes, sizes[1:]) if b < SURVIVAL_MAX_ENEMIES)
+    assert sizes[-1] == SURVIVAL_MAX_ENEMIES
+    env.wave = 20
+    env._spawn_wave(20)
+    assert sum(env.ships[a].active for a in env.team_agents[RED]) == SURVIVAL_MAX_ENEMIES
+
+
+@pytest.mark.parametrize("mode", ["deathmatch", "sudden_death", "siege", "survival"])
+@pytest.mark.parametrize("arena", ["mini", "large"])
+def test_eight_ships_per_team_fit_every_mode_and_arena(mode, arena):
+    env = TeamAsteroidsEnv(make_game(mode, arena, 8, 8))
+    env.reset(seed=0)
+    blues = [env.ships[a] for a in env.team_agents[BLUE]]
+    assert len(blues) == 8 and all(s.active for s in blues)
+    for i, a in enumerate(blues):  # nobody spawns on top of a teammate
+        for b in blues[i + 1:]:
+            assert env._wrapped_dist(a.pos, b.pos) > 2 * a.radius
+    idle(env, 3)
