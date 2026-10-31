@@ -1,0 +1,216 @@
+{
+  "defaults": {
+    "colours": {
+      "normal_bg": "#161c2e",
+      "hovered_bg": "#22304e",
+      "disabled_bg": "#11151f",
+      "selected_bg": "#2a5596",
+      "active_bg": "#2a5596",
+      "dark_bg": "#0b0f1cdd",
+      "normal_text": "#dbe3f4",
+      "hovered_text": "#ffffff",
+      "selected_text": "#ffffff",
+      "active_text": "#ffffff",
+      "disabled_text": "#5f6a84",
+      "normal_border": "#33425f",
+      "hovered_border": "#6aa6ff",
+      "disabled_border": "#232b3c",
+      "selected_border": "#6aa6ff",
+      "active_border": "#6aa6ff",
+      "filled_bar": "#4a8ef0",
+      "unfilled_bar": "#1d2538",
+      "link_text": "#8cc4ff",
+      "link_hover": "#c0e0ff"
+    },
+    "font": {
+      "name": "noto_sans",
+      "size": "16"
+    },
+    "misc": {
+      "shape": "rounded_rectangle",
+      "shape_corner_radius": "6",
+      "border_width": "1",
+      "shadow_width": "0"
+    }
+  },
+  "#screen": {
+    "colours": {
+      "dark_bg": "#00000000",
+      "normal_border": "#00000000"
+    },
+    "misc": {
+      "border_width": "0",
+      "shape": "rectangle"
+    }
+  },
+  "#card": {
+    "colours": {
+      "dark_bg": "#0b0f1ce6",
+      "normal_border": "#2b3956"
+    },
+    "misc": {
+      "shape": "rounded_rectangle",
+      "shape_corner_radius": "10",
+      "border_width": "1"
+    }
+  },
+  "#title": {
+    "font": {
+      "name": "noto_sans",
+      "size": "54",
+      "bold": "1"
+    },
+    "colours": {
+      "normal_text": "#a9d4ff"
+    }
+  },
+  "#subtitle": {
+    "font": {
+      "name": "noto_sans",
+      "size": "18",
+      "italic": "1"
+    },
+    "colours": {
+      "normal_text": "#8a98b8"
+    }
+  },
+  "#heading": {
+    "font": {
+      "name": "noto_sans",
+      "size": "22",
+      "bold": "1"
+    },
+    "colours": {
+      "normal_text": "#dbe3f4"
+    },
+    "misc": {
+      "text_horiz_alignment": "left"
+    }
+  },
+  "#field_label": {
+    "colours": {
+      "normal_text": "#9aa7c4"
+    },
+    "misc": {
+      "text_horiz_alignment": "left"
+    }
+  },
+  "#hint": {
+    "font": {
+      "name": "noto_sans",
+      "size": "14"
+    },
+    "colours": {
+      "normal_text": "#7b88a6"
+    },
+    "misc": {
+      "text_horiz_alignment": "left"
+    }
+  },
+  "#error": {
+    "colours": {
+      "normal_text": "#ff8a7a"
+    },
+    "misc": {
+      "text_horiz_alignment": "left"
+    }
+  },
+  "#blue_label": {
+    "colours": {
+      "normal_text": "#7fbcff"
+    },
+    "misc": {
+      "text_horiz_alignment": "left"
+    }
+  },
+  "#red_label": {
+    "colours": {
+      "normal_text": "#ff8f86"
+    },
+    "misc": {
+      "text_horiz_alignment": "left"
+    }
+  },
+  "#menu_button": {
+    "font": {
+      "name": "noto_sans",
+      "size": "20",
+      "bold": "1"
+    },
+    "misc": {
+      "shape_corner_radius": "8"
+    }
+  },
+  "#primary_button": {
+    "font": {
+      "name": "noto_sans",
+      "size": "18",
+      "bold": "1"
+    },
+    "colours": {
+      "normal_bg": "#2a5596",
+      "hovered_bg": "#3a6fc0",
+      "normal_border": "#6aa6ff"
+    }
+  },
+  "text_box": {
+    "colours": {
+      "dark_bg": "#00000000",
+      "normal_border": "#00000000"
+    },
+    "misc": {
+      "border_width": "0"
+    }
+  },
+  "#note": {
+    "font": {
+      "name": "noto_sans",
+      "size": "14"
+    },
+    "colours": {
+      "normal_text": "#7b88a6"
+    }
+  },
+  "#stat": {
+    "colours": {
+      "normal_text": "#dbe3f4"
+    },
+    "misc": {
+      "text_horiz_alignment": "right"
+    }
+  },
+  "#stat_name": {
+    "colours": {
+      "normal_text": "#9aa7c4"
+    },
+    "misc": {
+      "text_horiz_alignment": "left"
+    }
+  },
+  "#blue_head": {
+    "font": {
+      "name": "noto_sans",
+      "size": "16",
+      "bold": "1"
+    },
+    "colours": {
+      "normal_text": "#7fbcff"
+    },
+    "misc": {
+      "text_horiz_alignment": "right"
+    }
+  },
+  "#red_head": {
+    "font": {
+      "name": "noto_sans",
+      "size": "16",
+      "bold": "1"
+    },
+    "colours": {
+      "normal_text": "#ff8f86"
+    },
+    "misc": {
+      "text_horiz_alignment": "right"
+    }
+  }
+}

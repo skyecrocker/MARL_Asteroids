@@ -414,6 +414,8 @@ class Renderer:
             pygame.display.flip()
             self.clock.tick(fps)
             return None
+        if mode == "surface":  # caller blits it into a window it owns
+            return surf
         return np.transpose(np.array(pygame.surfarray.pixels3d(surf)), (1, 0, 2)).copy()
 
     def _draw_health_bar(self, surf, ship, to_px):
@@ -515,6 +517,8 @@ class Renderer:
                 pygame.draw.circle(surf, (255, 255, 255), mp(ship.pos), 5, 1)
         # Viewport box, tiled so it wraps with the torus. Uses a clip region rather than clipping the
         # rects themselves, which would draw false edges along the panel border.
+        if self.view_size >= max(env.width, env.height) - 1:
+            return  # viewport covers the whole map: a box would just be stray lines
         vs = self.view_size * k
         bx, by = cam[0] * k - vs / 2, cam[1] * k - vs / 2
         prev_clip = surf.get_clip()
@@ -617,8 +621,10 @@ class Renderer:
                                 (surf.get_height() - surface.get_height()) // 2))
 
     def close(self):
+        """Release drawing state. Only shuts pygame down if this renderer opened the display;
+        in ``surface``/``rgb_array`` mode the window (if any) belongs to someone else."""
         import pygame
-        if self.surface is not None:
+        if self.screen is not None:
             pygame.quit()
-            self.surface = None
-            self.screen = None
+        self.surface = None
+        self.screen = None

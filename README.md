@@ -17,12 +17,17 @@ marl_asteroids/
   opponents.py   OpponentPool: scripted + frozen snapshots + live self, PFSP sampling
   vec_env.py     TeamVecEnv (SB3 VecEnv, parameter sharing, death masking) + multiprocess version
   training.py    Self-play and win-rate evaluation callbacks
+  session.py     MatchSpec -> Match: builds playable games (shared by the app and watch.py)
+  checkpoints.py Finds trained models compatible with the current observation size
+  app/           Desktop app: menus, match setup, game, results, settings (pygame_gui)
 scripts/
+  app.py         Launch the desktop app (same as `uv run marl-asteroids`)
   train.py       Train (presets: baseline, selfplay)
   evaluate.py    Evaluation matrix -> CSV (mirrored by default)
   league.py      Round-robin league, Bradley-Terry ratings on the Elo scale
   watch.py       Watch agents, play as a human with difficulty handicaps, record video
-tests/           pytest suite (API compliance, seeding, reward/obs/mechanics regressions)
+tests/           pytest suite (API compliance, seeding, reward/obs/mechanics regressions, app)
+docs/app.md      Desktop app design
 models/phaseA/   Phase A checkpoints: self-play final, baseline, and difficulty-ladder snapshots
 models/legacy/   Checkpoints from the original project (need tag v0-legacy to run)
 results/legacy/  Original evaluation CSVs, figures, and analysis notebook
@@ -38,9 +43,32 @@ uv sync
 uv run pytest
 ```
 
-## Usage
+## Playing: the desktop app
 
-Run from the repo root.
+```bash
+uv run marl-asteroids
+```
+
+The main menu has **Play**, **Watch**, **Gallery**, and **Settings**. Match setup picks the
+scenario, team sizes, arena size, asteroid count, rock type, time limit, and a controller for every
+ship: you, any compatible trained model (shown with its rating), or a scripted bot. Play puts you in
+Blue 1 by default; Watch is AI on both sides. Your last setup for each is remembered.
+
+In game: `W`/`Up` thrust, `A`/`D` or arrows to turn, `Space` to shoot, `Esc` to pause (resume,
+restart, change setup, main menu), `Tab` for the sensor view.
+
+Only models whose observation size matches the current environment are offered, so older
+checkpoints never crash the app. Names and ratings come from `manifest.json` files next to the
+models (see `models/phaseA/`). Settings live in `~/.config/marl-asteroids/app.json`.
+
+On WSL, if the window does not appear after connecting or disconnecting a monitor, run
+`wsl --shutdown` from Windows and reopen the terminal: WSLg can keep a stale monitor layout and
+place windows off screen.
+
+## Command line
+
+Run from the repo root. The scripts are still the way to train and evaluate, and `watch.py` offers
+recording and a few options the app doesn't.
 
 ```bash
 # Train

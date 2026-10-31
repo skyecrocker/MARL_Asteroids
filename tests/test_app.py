@@ -1,0 +1,270 @@
+"""Desktop app: settings persistence, setup rules, and a headless run through every screen."""
+import json
+
+import pygame
+import pytest
+
+from marl_asteroids.app import screens as S
+from marl_asteroids.app.main import App
+from marl_asteroids.app.settings import WINDOW_SIZES, AppSettings
+from marl_asteroids.session import HUMAN, MatchSpec
+
+
+@pytest.fixture
+def app(tmp_path):
+    a = App(settings_path=tmp_path / "app.json")
+    a.settings.attract_mode = False  # keep tests fast and independent of the background match
+    a.push(S.MainMenuScreen(a))
+    yield a
+    while a.stack:
+        a.stack.pop().exit()
+    pygame.quit()
+
+
+def run(app, n):
+    for _ in range(n):
+        app.step()
+
+
+def press(app, text):
+    for element, callback in app.screen._buttons.items():
+        if element.text == text:
+            callback()
+            return
+    raise KeyError(f"no button {text!r} on {type(app.screen).__name__}")
+
+
+def run_until(app, screen_type, limit=20000):
+    for _ in range(limit):
+        if isinstance(app.screen, screen_type):
+            return
+        app.step()
+    raise AssertionError(f"never reached {screen_type.__name__}; on {type(app.screen).__name__}")
+
+
+# --------------------------------------------------------------------------- settings
+
+
+def test_settings_defaults_when_missing_or_corrupt(tmp_path):
+    assert AppSettings.load(tmp_path / "nope.json") == AppSettings()
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    assert AppSettings.load(bad) == AppSettings()
+    bad.write_text("[1, 2, 3]")
+    assert AppSettings.load(bad) == AppSettings()
+
+
+def test_settings_round_trip_and_tolerance(tmp_path):
+    p = tmp_path / "s.json"
+    s = AppSettings(window=[1600, 1000], effects=False, last_play={"scenario": "duel"})
+    s.save(p)
+    assert AppSettings.load(p) == s
+    data = json.loads(p.read_text())
+    data["window"] = [5, 5]       # nonsense window size is reset
+    data["future_option"] = True  # unknown keys are ignored
+    p.write_text(json.dumps(data))
+    loaded = AppSettings.load(p)
+    assert loaded.window == list(WINDOW_SIZES[0]) and loaded.effects is False
+
+
+def test_settings_save_creates_parent_dirs(tmp_path):
+    p = tmp_path / "a" / "b" / "app.json"
+    AppSettings().save(p)
+    assert p.exists() and not p.with_suffix(".tmp").exists()
+
+
+def test_config_path_env_override(tmp_path, monkeypatch):
+    from marl_asteroids.app.settings import config_path
+    monkeypatch.setenv("MARL_ASTEROIDS_CONFIG", str(tmp_path / "x.json"))
+    assert config_path() == tmp_path / "x.json"
+
+
+# ----------------------------------------------------------------------------- setup
+
+
+def test_sanitize_replaces_missing_models_and_scenarios():
+    spec = MatchSpec(scenario="duel", controllers={"blue_0": "models/gone.zip", "red_0": "dummy"},
+                     default_controller="models/also_gone.zip", difficulty="nightmare")
+    clean = S.sanitize(spec, "watch")
+    assert S.valid_controller(clean.default_controller)
+    assert clean.controllers["blue_0"] == clean.default_controller
+    assert clean.controllers["red_0"] == "dummy"
+    assert clean.difficulty == "normal"
+    assert S.sanitize(MatchSpec(scenario="deleted_mode"), "play").scenario == "demo_team2"
+
+
+def test_play_defaults_put_you_in_blue_1(app):
+    setup = S.SetupScreen(app, "play")
+    assert setup.spec.controllers["blue_0"] == HUMAN
+    watch = S.SetupScreen(app, "watch")
+    assert HUMAN not in watch.spec.controllers.values()
+
+
+def test_only_one_human_ship(app):
+    setup = S.SetupScreen(app, "play")
+    app.push(setup)
+    setup._set_controller("red_0", HUMAN)
+    humans = [a for a, c in setup.spec.controllers.items() if c == HUMAN]
+    assert humans == ["red_0"]
+
+
+def test_team_size_change_keeps_existing_choices(app):
+    setup = S.SetupScreen(app, "watch")
+    app.push(setup)
+    setup.spec.controllers["blue_0"] = "dummy"
+    setup._set("m_blue", 4, rebuild=True)
+    assert list(a for a in setup.spec.controllers if a.startswith("blue")) == \
+        ["blue_0", "blue_1", "blue_2", "blue_3"]
+    assert setup.spec.controllers["blue_0"] == "dummy"
+    setup._set("m_blue", 1, rebuild=True)
+    assert [a for a in setup.spec.controllers if a.startswith("blue")] == ["blue_0"]
+
+
+def test_scenario_change_resets_scenario_specific_overrides(app):
+    setup = S.SetupScreen(app, "watch")
+    app.push(setup)
+    setup._set("n_red", 4, rebuild=True)
+    setup._set_asteroids(17)
+    setup._set_scenario("duel")
+    assert setup.spec.n_red is None and setup.spec.num_asteroids is None
+    assert set(setup.spec.controllers) == {"blue_0", "red_0"}
+
+
+def test_bad_setup_reports_instead_of_crashing(app, monkeypatch):
+    setup = S.SetupScreen(app, "watch")
+    app.push(setup)
+    monkeypatch.setattr(S, "build_match", lambda spec: (_ for _ in ()).throw(ValueError("boom")))
+    setup.start()
+    run(app, 4)
+    assert app.screen is setup and setup.status_is_error and "boom" in setup.status
+
+
+# ------------------------------------------------------------------------- full flow
+
+
+def quick_watch(app):
+    """Watch setup with bots and a short clock, so games end fast and deterministically."""
+    setup = S.SetupScreen(app, "watch")
+    setup.spec = MatchSpec(scenario="duel", time_limit=8.0, seed=3,
+                           controllers={"blue_0": "heuristic_1.0", "red_0": "dummy"})
+    app.push(setup)
+    return setup
+
+
+def test_full_flow_through_every_screen(app):
+    run(app, 3)
+    press(app, "Settings"); run(app, 2)
+    assert isinstance(app.screen, S.SettingsScreen)
+    press(app, "Back"); run(app, 2)
+    press(app, "Gallery"); run(app, 2)
+    assert isinstance(app.screen, S.GalleryScreen)
+    press(app, "Back"); run(app, 2)
+
+    setup = quick_watch(app)
+    press(app, "Start match")
+    run_until(app, S.GameScreen, limit=10)
+    game = app.screen
+    assert game.env is not None and game.env.on_frame is not None
+    run_until(app, S.ResultsScreen)
+    results = app.screen
+    assert results.winner == 1 and results.stats.games == 1  # heuristic beats a dummy
+    assert app.settings.last_watch["scenario"] == "duel"     # setup remembered
+
+    press(app, "Play again")
+    assert isinstance(app.screen, S.GameScreen) and app.screen.game_index == 1
+    run_until(app, S.ResultsScreen)
+    press(app, "Change setup")
+    assert app.screen is setup
+    press(app, "Back")
+    assert isinstance(app.screen, S.MainMenuScreen) and len(app.stack) == 1
+
+
+def test_game_draws_every_physics_frame(app):
+    quick_watch(app)
+    press(app, "Start match")
+    run_until(app, S.GameScreen, limit=10)
+    game = app.screen
+    before_frames, before_physics = app.frames, game.env.frame
+    run(app, 20)  # 20 decisions
+    drawn = app.frames - before_frames
+    advanced = game.env.frame - before_physics
+    assert advanced > 0 and drawn >= advanced  # at least one presented frame per physics frame
+
+
+def test_pause_freezes_the_game_and_resume_continues(app):
+    quick_watch(app)
+    press(app, "Start match")
+    run_until(app, S.GameScreen, limit=10)
+    game = app.screen
+    run(app, 5)
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
+    run(app, 1)
+    assert game.paused
+    frozen = game.env.frame
+    run(app, 30)
+    assert game.env.frame == frozen
+    press(app, "Resume")
+    run(app, 5)
+    assert not game.paused and game.env.frame > frozen
+
+
+def test_restart_and_main_menu_from_pause(app):
+    quick_watch(app)
+    press(app, "Start match")
+    run_until(app, S.GameScreen, limit=10)
+    game = app.screen
+    run(app, 10)
+    game.pause()
+    press(app, "Restart")
+    assert not game.paused and game.env.frame == 0 and game.game_index == 1
+    game.pause()
+    press(app, "Main menu")
+    assert isinstance(app.screen, S.MainMenuScreen) and len(app.stack) == 1
+    assert game.env is None  # match closed on the way out
+
+
+def test_tab_toggles_sensor_view(app):
+    quick_watch(app)
+    press(app, "Start match")
+    run_until(app, S.GameScreen, limit=10)
+    game = app.screen
+    start = game.renderer.show_obs
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_TAB))
+    run(app, 1)
+    assert game.renderer.show_obs is (not start)
+
+
+def test_human_ship_idles_without_input_and_game_still_ends(app):
+    setup = S.SetupScreen(app, "play")
+    setup.spec = MatchSpec(scenario="duel", time_limit=5.0, seed=1, difficulty="brutal",
+                           controllers={"blue_0": HUMAN, "red_0": "dummy"})
+    app.push(setup)
+    press(app, "Start")
+    run_until(app, S.ResultsScreen)
+    assert app.screen.human == "blue_0"
+
+
+def test_window_resize_rebuilds_current_screen(app):
+    app.set_window_size((1440, 900))
+    assert app.window.get_size() == (1440, 900) and app.settings.window == [1440, 900]
+    run(app, 2)
+    assert isinstance(app.screen, S.MainMenuScreen) and app.screen.root.rect.size == (1440, 900)
+
+
+def test_escape_on_setup_goes_back(app):
+    quick_watch(app)
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
+    run(app, 1)
+    assert isinstance(app.screen, S.MainMenuScreen)
+
+
+def test_attract_mode_background_runs(tmp_path):
+    a = App(settings_path=tmp_path / "app.json")
+    a.settings.attract_mode = True
+    a.push(S.MainMenuScreen(a))
+    for _ in range(40):
+        a.step()
+    assert a._background is not None and a._background.env.frame > 0
+    while a.stack:
+        a.stack.pop().exit()
+    pygame.quit()

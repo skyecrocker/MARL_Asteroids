@@ -8,8 +8,11 @@ dependencies = [
     "gymnasium==1.3.0",
     "numpy==2.4.6",
     "pettingzoo==1.27.0",
-    "pygame==2.6.1",
-    # No [extra]: it pulls pygame-ce, which conflicts with pygame, plus unused Atari deps
+    # pygame-ce: maintained drop-in fork of pygame, required by pygame_gui. Never install plain
+    # "pygame" alongside it: both provide the same `pygame` module and clobber each other.
+    "pygame-ce",
+    "pygame-gui",
+    # No SB3 [extra]: it pulls unused Atari deps
     "stable-baselines3==2.9.0",
     "tensorboard==2.21.0",
     "tqdm==4.70.1",
@@ -17,6 +20,9 @@ dependencies = [
     "supersuit==3.11.0",
     "torch==2.14.1",
 ]
+
+[project.scripts]
+marl-asteroids = "marl_asteroids.app.main:main"
 
 [dependency-groups]
 dev = [

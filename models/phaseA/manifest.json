@@ -1,0 +1,29 @@
+{
+  "files": {
+    "selfplay_final.zip": {
+      "name": "Self-play ace",
+      "elo": 1718,
+      "description": "20M steps of league self-play. The strongest agent."
+    },
+    "ladder_5M.zip": {
+      "name": "Self-play veteran",
+      "elo": 1639,
+      "description": "Self-play snapshot after 5M steps."
+    },
+    "baseline.zip": {
+      "name": "Bot hunter",
+      "elo": 1588,
+      "description": "8M steps against scripted bots only. Crushes bots, loses to self-play."
+    },
+    "ladder_2.5M.zip": {
+      "name": "Self-play regular",
+      "elo": 1440,
+      "description": "Self-play snapshot after 2.5M steps."
+    },
+    "ladder_1M.zip": {
+      "name": "Self-play rookie",
+      "elo": 1026,
+      "description": "Self-play snapshot after 1M steps. About as strong as the heuristic bot."
+    }
+  }
+}

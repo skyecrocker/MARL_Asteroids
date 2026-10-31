@@ -48,13 +48,16 @@ def obs_dim(config: GameConfig) -> int:
 
 
 class TeamAsteroidsEnv(ParallelEnv):
-    metadata = {"render_modes": ["human", "rgb_array"], "name": "team_asteroids_v1", "render_fps": 60}
+    metadata = {"render_modes": ["human", "rgb_array", "surface"], "name": "team_asteroids_v1", "render_fps": 60}
 
     def __init__(self, config: GameConfig, render_mode: Optional[str] = None, **render_options):
         self.config = config
         self.render_mode = render_mode
         self.render_options = render_options  # forwarded to render.Renderer
         self.renderer = None
+        # Optional callback run after every physics frame (agents decide every ``action_repeat``
+        # frames). Lets an app draw and pace at the physics rate. Never set during training.
+        self.on_frame = None
         self.n_red = config.n_red
         self.m_blue = config.m_blue
         self.width = float(config.width)
@@ -149,6 +152,8 @@ class TeamAsteroidsEnv(ParallelEnv):
                             ind[source] += rcfg.kill
             if self.render_mode == "human":
                 self.render()
+            if self.on_frame is not None:
+                self.on_frame()
             if self._team_alive(RED) == 0 or self._team_alive(BLUE) == 0 or self._out_of_time():
                 break
         self.decision_step += 1

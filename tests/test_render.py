@@ -113,3 +113,38 @@ def test_renderer_is_not_created_without_render_mode():
     env = TeamAsteroidsEnv(get_scenario("duel"))
     env.reset(seed=0)
     assert env.render() is None and env.renderer is None
+
+
+def test_surface_mode_returns_a_surface_and_never_owns_the_display():
+    import pygame
+
+    pygame.display.init()
+    window = pygame.display.set_mode((320, 320))  # stands in for an app-owned window
+    env = TeamAsteroidsEnv(get_scenario("duel"), render_mode="surface", window=300)
+    env.reset(seed=0)
+    surf = env.render()
+    assert isinstance(surf, pygame.Surface) and surf.get_size() == (300, 300)
+    assert env.renderer.screen is None  # did not create its own window
+    env.close()
+    # The app's window must survive the env closing
+    assert pygame.display.get_init() and pygame.display.get_surface() is window
+    pygame.display.quit()
+
+
+def test_on_frame_runs_once_per_physics_frame():
+    env = TeamAsteroidsEnv(get_scenario("duel", max_frames=600))
+    env.reset(seed=0)
+    frames = []
+    env.on_frame = lambda: frames.append(env.frame)
+    env.step({a: [0, 0, 0] for a in env.agents})
+    assert frames == list(range(1, env.config.action_repeat + 1))
+
+
+def test_on_frame_stops_at_game_end():
+    env = TeamAsteroidsEnv(get_scenario("duel", max_frames=3, action_repeat=2))
+    env.reset(seed=0)
+    calls = []
+    env.on_frame = lambda: calls.append(env.frame)
+    while env.agents:
+        env.step({a: [0, 0, 0] for a in env.agents})
+    assert calls == [1, 2, 3]  # last decision stops at the time limit mid-repeat

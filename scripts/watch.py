@@ -1,30 +1,23 @@
-"""Watch (or play) games in a pygame window.
+"""Watch (or play) games in a pygame window from the command line.
+
+The desktop app (``uv run marl-asteroids``) is the friendlier way to do this; both build matches
+through ``marl_asteroids.session``.
 
 Examples:
-    uv run python scripts/watch.py --scenario demo_team2 --blue models/baseline_v1/best_model.zip
-    uv run python scripts/watch.py --scenario demo_duel --blue human --red models/baseline_v1/best_model.zip \
-        --difficulty easy
+    uv run python scripts/watch.py --scenario demo_team2 --blue models/phaseA/selfplay_final.zip
+    uv run python scripts/watch.py --scenario demo_duel --blue human \
+        --red models/phaseA/selfplay_final.zip --difficulty easy
     uv run python scripts/watch.py --scenario demo_team3 --blue a.zip --red b.zip --games 5 --record out.mp4
 """
 from __future__ import annotations
+
 import argparse
 import time
 
-import numpy as np
 import pygame
 
-from marl_asteroids.config import SCENARIOS, get_scenario, scale_map, set_team_fire_rate
-from marl_asteroids.env import TeamAsteroidsEnv
-from marl_asteroids.policies import DelayedPolicy, resolve_policy
-
-# Handicaps for the AI side when a human is playing: (reaction delay in decisions, reload frames).
-# Reload frames dominate: they cap the AI's damage output without breaking its movement or aim.
-DIFFICULTY = {
-    "easy": (6, 110),
-    "normal": (3, 70),
-    "hard": (1, 45),
-    "brutal": (0, None),  # unhandicapped
-}
+from marl_asteroids.config import SCENARIOS
+from marl_asteroids.session import DIFFICULTY, MatchSpec, agent_names, build_config, build_match
 
 
 def main():
@@ -59,62 +52,42 @@ def main():
     ap.add_argument("--record", default=None, help="Save to a video/gif (needs imageio)")
     args = ap.parse_args()
 
-    cfg = get_scenario(args.scenario)
+    spec = MatchSpec(scenario=args.scenario, scale=args.scale, asteroid_density=args.asteroid_density,
+                     difficulty=args.difficulty, follow=args.follow, view=args.view,
+                     stochastic=args.stochastic, seed=args.seed)
+    # Per-ship controllers: a single value applies to the whole team; a comma-separated list
+    # assigns per ship (cycled), e.g. --blue human,heuristic_1.0 puts you in blue_0 with a wingman.
+    for agent in agent_names(build_config(spec)):
+        team, idx = agent.split("_")
+        options = [s.strip() for s in getattr(args, team).split(",")]
+        spec.controllers[agent] = options[int(idx) % len(options)]
+    try:
+        match = build_match(spec)
+    except ValueError as e:
+        ap.error(str(e))
+    cfg = match.config
+
     if args.scale != 1.0:
-        cfg = scale_map(cfg, args.scale, asteroid_density=args.asteroid_density)
         print(f"Arena {cfg.width:.0f}x{cfg.height:.0f}, {cfg.num_asteroids} asteroids, "
               f"max_frames {cfg.max_frames}")
-    team_sizes = {"red": cfg.n_red, "blue": cfg.m_blue}
-    # Per-agent specs: one spec applies to the whole team, a comma-separated list assigns per ship
-    # (cycled), e.g. --blue human,heuristic_1.0 puts you in blue_0 with an AI wingman.
-    specs = {t: [s.strip() for s in getattr(args, t).split(",")] for t in ("red", "blue")}
-    assignment = {f"{t}_{i}": specs[t][i % len(specs[t])]
-                  for t, n in team_sizes.items() for i in range(n)}
-    human_agents = [a for a, s in assignment.items() if s == "human"]
-
-    difficulty = args.difficulty or ("normal" if human_agents else "brutal")
-    delay, fire_rate = DIFFICULTY[difficulty]
-    human_teams = {a.split("_")[0] for a in human_agents}
-    if human_agents and fire_rate is not None:
-        for t in ("red", "blue"):
-            if t not in human_teams:
-                cfg = set_team_fire_rate(cfg, t, fire_rate)
-
-    # One policy instance per distinct spec, so inference stays batched
-    cache = {}
-    for spec in set(assignment.values()):
-        pol = resolve_policy(spec, deterministic=not args.stochastic)
-        if human_agents and spec != "human" and delay > 0:
-            pol = DelayedPolicy(pol, delay)
-        cache[spec] = pol
-    policies = {agent: cache[spec] for agent, spec in assignment.items()}
-
-    if human_agents:
-        print(f"You are flying: {', '.join(human_agents)}")
-        print(f"Difficulty {difficulty}: AI reaction delay {delay} decisions, reload {fire_rate} frames")
+    if match.human_agents:
+        print(f"You are flying: {', '.join(match.human_agents)}")
+        print(f"Difficulty {match.difficulty}: AI reaction delay {match.delay} decisions, "
+              f"reload {match.fire_rate} frames")
         print("Controls: W/Up thrust, A/D or Left/Right turn, Space shoot, Esc quit")
-    for agent, spec in sorted(assignment.items()):
-        print(f"  {agent:8s} <- {spec}")
+    for agent, controller in sorted(match.assignment.items()):
+        print(f"  {agent:8s} <- {controller}")
+    if match.follow:
+        print(f"Camera follows {match.follow} ({args.view:.0f} world units across)")
 
-    if args.follow == "auto":
-        follow = human_agents[0] if human_agents else None
-    elif args.follow == "none":
-        follow = None
-    else:
-        follow = args.follow
-        if follow not in assignment:
-            ap.error(f"--follow {follow!r} is not an agent in this scenario: {sorted(assignment)}")
-    if follow:
-        print(f"Camera follows {follow} ({args.view:.0f} world units across)")
-
-    env = TeamAsteroidsEnv(cfg, render_mode="rgb_array" if args.record else "human",
-                           window=args.window, effects=not args.no_effects,
-                           follow=follow, view_size=args.view, minimap=not args.no_minimap,
-                           show_obs=args.show_obs, obs_agent=args.obs_agent)
+    env = match.make_env(render_mode="rgb_array" if args.record else "human",
+                         window=args.window, effects=not args.no_effects,
+                         minimap=not args.no_minimap, show_obs=args.show_obs, obs_agent=args.obs_agent)
+    env.metadata = dict(env.metadata, render_fps=args.fps)
     frames = []
     try:
         for game in range(args.games):
-            env.reset(seed=None if args.seed is None else args.seed + game)
+            match.reset(game)
             first = env.render()  # initializes pygame before any policy polls the keyboard
             if args.record and first is not None:
                 frames.append(first)
@@ -128,15 +101,7 @@ def main():
                         elif event.type == pygame.KEYDOWN and event.key == pygame.K_TAB \
                                 and env.renderer is not None:
                             env.renderer.show_obs = not env.renderer.show_obs
-                groups = {}
-                for a in env.agents:
-                    pol = policies[a]
-                    groups.setdefault(id(pol), (pol, []))[1].append(a)
-                actions = {}
-                for pol, ags in groups.values():
-                    acts = pol.act(np.stack([env.get_obs(a) for a in ags]), [(env, a) for a in ags])
-                    actions.update(zip(ags, acts))
-                env.step(actions)
+                match.step()
                 if args.record:
                     frames.append(env.render())
             if not running:
@@ -151,12 +116,11 @@ def main():
                 while time.monotonic() < hold_until:
                     env.render()
     finally:
-        env.close()
+        match.close()
     if args.record and frames:
         import imageio.v2 as imageio
-        # One frame is captured per env.step, which covers ``action_repeat`` physics frames, so
-        # real-time playback is fps / action_repeat. (Previously this also dropped every other
-        # frame at fps/2, which played clips back at 2x speed.)
+        # One frame per env.step, which covers ``action_repeat`` physics frames, so real-time
+        # playback is fps / action_repeat.
         out_fps = max(1, round(args.fps / cfg.action_repeat))
         imageio.mimsave(args.record, frames, fps=out_fps)
         print(f"Saved {args.record} ({len(frames)} frames at {out_fps} fps, "
