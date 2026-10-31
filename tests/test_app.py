@@ -107,7 +107,7 @@ def test_sanitize_replaces_missing_models_and_bad_settings():
 def test_defaults_put_you_in_blue_1_in_a_deathmatch(app):
     setup = S.SetupScreen(app)
     assert setup.spec.controllers["blue_0"] == HUMAN
-    assert setup.spec.mode == "deathmatch" and setup.spec.arena == "medium"
+    assert setup.spec.mode == "deathmatch" and setup.spec.arena == "small"
 
 
 def test_main_menu_has_no_watch_button(app):
@@ -131,20 +131,44 @@ def test_switching_to_an_objective_mode_swaps_trained_agents_for_bots(app):
     assert setup.spec.controllers["red_0"] == "models/phaseA/baseline.zip"
 
 
-def test_spawns_option_only_in_deathmatch(app):
+def test_spawns_option_only_in_combat_modes(app):
     setup = S.SetupScreen(app)
     app.push(setup)
-    assert "Spawns" in texts_on(setup)
-    setup._set_mode("survival")
-    assert "Spawns" not in texts_on(setup) and "Max per wave" in texts_on(setup)
+    for mode, shown in (("deathmatch", True), ("sudden_death", True), ("siege", False),
+                        ("survival", False)):
+        setup._set_mode(mode)
+        assert ("Spawns" in texts_on(setup)) is shown, mode
+    assert "Max per wave" in texts_on(setup)
+
+
+def test_trained_agents_stay_in_both_combat_modes(app):
+    setup = S.SetupScreen(app)
+    app.push(setup)
+    agent = "models/phaseA/selfplay_final.zip"
+    setup.spec.controllers["red_0"] = agent
+    for mode in ("sudden_death", "deathmatch"):
+        setup._set_mode(mode)
+        assert setup.spec.controllers["red_0"] == agent and not setup.status
+
+
+def test_deathmatch_always_has_a_clock(app):
+    setup = S.SetupScreen(app)
+    app.push(setup)
+    time_choice = [c for c in setup._choices.values() if c.options[0][1] == S.KEEP][0]
+    assert None not in [v for _, v in time_choice.options]  # no "No limit" for deathmatch
+    setup._set_mode("sudden_death")
+    time_choice = [c for c in setup._choices.values() if c.options[0][1] == S.KEEP][0]
+    assert None in [v for _, v in time_choice.options]
+    saved = MatchSpec(mode="deathmatch", arena="small", time_limit=None)
+    assert S.sanitize(saved).time_limit == S.KEEP
 
 
 def test_arena_change_resets_asteroid_count(app):
     setup = S.SetupScreen(app)
     app.push(setup)
     setup._set_asteroids(17)
-    setup._set_arena("huge")
-    assert setup.spec.num_asteroids is None and setup._cfg().width == 2400
+    setup._set_arena("large")
+    assert setup.spec.num_asteroids is None and setup._cfg().width == 4800
 
 
 def test_only_one_human_ship(app):

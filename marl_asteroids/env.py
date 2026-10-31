@@ -19,7 +19,7 @@ import gymnasium as gym
 import numpy as np
 from pettingzoo.utils.env import ParallelEnv
 
-from .config import MODES, GameConfig
+from .config import MODES, RESPAWN_MODES, GameConfig
 from .entities import Asteroid, Bullet, Ship, Station
 
 RED, BLUE = 0, 1
@@ -69,7 +69,7 @@ class TeamAsteroidsEnv(ParallelEnv):
         self.mode = config.mode
         # In respawning modes a destroyed ship is not "done": it stays in ``agents`` (with an
         # all-zero observation) until it returns, and everyone terminates together at game end.
-        self.persistent_agents = self.mode != "deathmatch"
+        self.persistent_agents = self.mode in RESPAWN_MODES
         self.stations: Dict[int, Station] = {}
 
         self.possible_agents = [f"red_{i}" for i in range(self.n_red)] + \
@@ -114,6 +114,7 @@ class TeamAsteroidsEnv(ParallelEnv):
         self.damage_log: List[Tuple[str, str, int, bool]] = []
         self.station_log: List[Tuple[str, int, int, bool]] = []  # (source, station team, dmg, destroyed)
         self.station_damage = {RED: 0, BLUE: 0}  # station damage dealt BY each team
+        self.team_kills = {RED: 0, BLUE: 0}      # enemy ships destroyed by each team's fire
         self.wave = 1
         self.waves_cleared = 0
         self._wave_timer: Optional[int] = None
@@ -155,6 +156,8 @@ class TeamAsteroidsEnv(ParallelEnv):
                     self.kill_log.append((source, victim))
                     ind[victim] += rcfg.death
                     self._schedule_respawn(victim)
+                    if source in self.ships and not friendly:
+                        self.team_kills[self.team_of[source]] += 1
                 if source in self.ships:
                     if friendly:
                         ind[source] += rcfg.teamdamage * damage
@@ -277,10 +280,11 @@ class TeamAsteroidsEnv(ParallelEnv):
         return ((st.pos[0] + math.cos(theta) * r) % self.width,
                 (st.pos[1] + math.sin(theta) * r) % self.height, base)
 
-    def _far_spawn(self) -> Tuple[float, float, float]:
-        """Survival: a point far from every living blue ship, facing the nearest one."""
+    def _far_spawn(self, away_from: int = BLUE) -> Tuple[float, float, float]:
+        """A point far from every living ship of team ``away_from``, facing the nearest one.
+        Survival waves arrive this way (away from blue); deathmatch respawns away from the enemy."""
         cfg, rng = self.config, self.np_random
-        blues = [s.pos for a, s in self.ships.items() if self.team_of[a] == BLUE and s.active]
+        blues = [s.pos for a, s in self.ships.items() if self.team_of[a] == away_from and s.active]
         min_d = cfg.wave_spawn_distance * min(self.width, self.height)
         best, best_d = None, -1.0
         for _ in range(60):
@@ -630,11 +634,14 @@ class TeamAsteroidsEnv(ParallelEnv):
                                              for a in self.team_agents[team])
         if self.mode == "survival" and team == RED:
             return False  # red is the endless enemy: clearing a wave just brings the next one
+        if self.mode == "deathmatch":
+            return False  # everyone respawns: only the clock ends a deathmatch
         return True
 
     def _schedule_respawn(self, agent: str):
         ship = self.ships[agent]
-        if self.mode == "siege" and self.stations[self.team_of[agent]].active:
+        if (self.mode == "deathmatch"
+                or (self.mode == "siege" and self.stations[self.team_of[agent]].active)):
             ship.respawn_timer = self.config.respawn_delay
 
     def _tick_mode(self):
@@ -642,19 +649,22 @@ class TeamAsteroidsEnv(ParallelEnv):
         cfg = self.config
         for st in self.stations.values():
             st.tick()
-        if self.mode == "siege":
+        if self.mode in ("siege", "deathmatch"):
             for agent, ship in self.ships.items():
                 if ship.active:
                     continue
                 if ship.respawn_timer is None:
-                    # However the ship was destroyed, it comes back while its station stands.
-                    # (Once the station falls its pending respawns are cleared and this stays off.)
+                    # However the ship was destroyed, it comes back (in siege, while its station
+                    # stands: once it falls, pending respawns are cleared and this stays off).
                     self._schedule_respawn(agent)
                     if ship.respawn_timer is None:
                         continue
                 ship.respawn_timer -= 1
                 if ship.respawn_timer <= 0:
-                    x, y, heading = self.station_slot(agent)
+                    if self.mode == "siege":
+                        x, y, heading = self.station_slot(agent)
+                    else:  # deathmatch: somewhere safe, away from the enemy team
+                        x, y, heading = self._far_spawn(away_from=1 - self.team_of[agent])
                     ship.respawn(x, y, heading, protection=cfg.spawn_protection)
         elif self.mode == "survival":
             if self._wave_timer is None:
@@ -700,14 +710,19 @@ class TeamAsteroidsEnv(ParallelEnv):
         elif self.mode == "survival":
             out["waves_cleared"] = self.waves_cleared
             out["wave"] = self.wave
+        elif self.mode == "deathmatch":
+            out["kills"] = dict(self.team_kills)
         return out
 
     def _timeout_winner(self) -> int:
         """Who takes a game that ran out of time.
 
-        Survival: blue, for holding out. Siege: the healthier station (as a fraction), then the
-        healthier fleet. Deathmatch: the healthier fleet. The tiebreak turns a flat zero-reward draw
-        into a real gradient for training."""
+        Deathmatch: the team with more kills (equal kills is a draw). Survival: blue, for holding
+        out. Siege: the healthier station (as a fraction), then the healthier fleet. Sudden death:
+        the healthier fleet, which turns a flat zero-reward draw into a real gradient for training."""
+        if self.mode == "deathmatch":
+            r, b = self.team_kills[RED], self.team_kills[BLUE]
+            return RED if r > b else (BLUE if b > r else -1)
         if self.mode == "survival":
             return BLUE
         if self.mode == "siege":

@@ -736,6 +736,8 @@ class Renderer:
         for team, station in env.stations.items():
             extra[team] = (f"station {station.health_fraction:.0%}" if station.active
                            else "station lost")
+        if env.mode == "deathmatch":
+            extra = {team: f"kills {env.team_kills[team]}" for team in (RED, BLUE)}
         surf.blit(self.font.render(f"RED {red}  {extra[RED]}", True,
                                    TEAM_COLORS[RED]["hull"]), (14, 12))
         label = self.font.render(f"{extra[BLUE]}  BLUE {blue}", True, TEAM_COLORS[BLUE]["hull"])

@@ -136,9 +136,10 @@ class GameConfig:
     collision_damage_cooldown: int = 45
     bounce_restitution: float = 0.85
 
-    # Game mode (see MODES): "deathmatch", "siege" or "survival"
-    mode: str = "deathmatch"
-    respawn_delay: int = 180        # Frames a destroyed ship waits before respawning
+    # Game mode (see MODES). The default, sudden death (no respawns, last team standing), is what
+    # every named scenario, training run and evaluation uses; the app picks modes explicitly.
+    mode: str = "sudden_death"
+    respawn_delay: int = 180        # Frames a destroyed ship waits before respawning (siege, deathmatch)
     spawn_protection: int = 90      # Frames of invulnerability after (re)spawning
 
     # Station siege. Each team has a station; ships respawn at it while it stands. Its shield
@@ -324,30 +325,35 @@ SCENARIOS.update({
 # ---------------------------------------------------------------------------
 
 MODES: Dict[str, str] = {
-    "deathmatch": "Destroy every enemy ship. No respawns.",
+    "deathmatch": "Destroyed ships respawn. The team with the most kills when time runs out wins.",
+    "sudden_death": "No respawns. The last team with ships left wins.",
     "siege": "Ships respawn while their station stands. Destroy the enemy station, then their "
              "fleet. A lone ship can't break a station's shield.",
     "survival": "Blue holds out against growing waves of red. Fallen allies return between waves.",
 }
-MODE_NAMES: Dict[str, str] = {"deathmatch": "Deathmatch", "siege": "Station siege",
-                              "survival": "Survival"}
-# Default time limit per mode in seconds (None = no limit). Siege can stall if both teams turtle,
-# so it gets a clock; the station with more health wins the timeout.
-MODE_TIME_LIMIT: Dict[str, Optional[float]] = {"deathmatch": None, "siege": 300.0, "survival": None}
+MODE_NAMES: Dict[str, str] = {"deathmatch": "Deathmatch", "sudden_death": "Sudden death",
+                              "siege": "Station siege", "survival": "Survival"}
+# Default time limit per mode in seconds (None = no limit). Deathmatch needs one (that's how it
+# ends); siege gets one because it can stall if both teams turtle (healthier station wins).
+MODE_TIME_LIMIT: Dict[str, Optional[float]] = {"deathmatch": 300.0, "sudden_death": None,
+                                               "siege": 300.0, "survival": None}
+# Modes where destroyed ships come back. In these the env keeps every agent until the game ends.
+RESPAWN_MODES = ("deathmatch", "siege", "survival")
 
-ARENA_SIZES: Dict[str, float] = {"small": 800.0, "medium": 1200.0, "large": 1600.0, "huge": 2400.0}
-ARENA_ASTEROIDS: Dict[str, int] = {"small": 3, "medium": 5, "large": 8, "huge": 14}
+ARENA_SIZES: Dict[str, float] = {"mini": 600.0, "small": 1200.0, "medium": 2400.0, "large": 4800.0}
+# Roughly constant density up to medium, sparser on large so it doesn't become an asteroid field
+ARENA_ASTEROIDS: Dict[str, int] = {"mini": 2, "small": 5, "medium": 14, "large": 40}
 
 
-def make_game(mode: str = "deathmatch", arena: str = "medium", m_blue: int = 2, n_red: int = 2,
+def make_game(mode: str = "deathmatch", arena: str = "small", m_blue: int = 2, n_red: int = 2,
               num_asteroids: Optional[int] = None, asteroids_split: bool = True,
               fixed_spawns: bool = True, time_limit: Optional[float] = None,
               use_mode_time_limit: bool = True) -> GameConfig:
     """Build a game from the handful of choices the app exposes.
 
     Physics are the defaults the agents were trained on, so trained models play every arena.
-    ``fixed_spawns`` (deathmatch only) lines the teams up facing each other's flank; otherwise ships
-    spawn at random. Siege ships always spawn at their station, and survival puts blue in the middle
+    ``fixed_spawns`` (deathmatch and sudden death) lines the teams up facing each other's flank;
+    otherwise ships spawn at random. Deathmatch respawns are always random, far from the enemy. Siege ships always spawn at their station, and survival puts blue in the middle
     with red waves arriving from far away. Asteroids are always placed at random.
     """
     if mode not in MODES:
@@ -367,7 +373,7 @@ def make_game(mode: str = "deathmatch", arena: str = "medium", m_blue: int = 2, 
         # Spawning ships 150 px apart is fine on a small map but too close to react on a big one
         min_spawn_dist=max(150.0, size * 0.15),
     )
-    if mode == "deathmatch" and fixed_spawns:
+    if mode in ("deathmatch", "sudden_death") and fixed_spawns:
         def formation(n, x, facing):
             spacing = min(320.0, size * 0.75 / max(1, n))
             return _line_formation(n, x, size / 2, spacing, facing)

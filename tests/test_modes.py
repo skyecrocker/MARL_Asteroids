@@ -48,7 +48,7 @@ def play(env, blue="heuristic_1.0", red="heuristic_1.0", max_steps=20000):
 
 def test_make_game_sizes_and_defaults():
     for arena, size in ARENA_SIZES.items():
-        for mode in ("deathmatch", "siege", "survival"):
+        for mode in ("deathmatch", "sudden_death", "siege", "survival"):
             cfg = make_game(mode, arena, 2, 3)
             assert (cfg.width, cfg.height) == (size, size)
             assert cfg.num_asteroids == ARENA_ASTEROIDS[arena]
@@ -79,7 +79,7 @@ def test_fixed_deathmatch_spawns_face_off_and_random_spawns_vary():
     assert not np.allclose(r1.ships["red_0"].pos, r2.ships["red_0"].pos)
 
 
-@pytest.mark.parametrize("mode", ["deathmatch", "siege", "survival"])
+@pytest.mark.parametrize("mode", ["deathmatch", "sudden_death", "siege", "survival"])
 def test_observation_size_is_unchanged_so_trained_agents_load(mode):
     env = env_for(mode)
     assert obs_dim(env.config) == 221
@@ -346,7 +346,7 @@ def test_survival_timeout_is_a_blue_win():
     assert env.game_over and env.winner == BLUE
 
 
-@pytest.mark.parametrize("mode", ["siege", "survival"])
+@pytest.mark.parametrize("mode", ["deathmatch", "siege", "survival"])
 def test_respawning_modes_keep_every_agent_until_the_end(mode):
     env = env_for(mode, max_frames=40)
     everyone = list(env.agents)
@@ -357,6 +357,101 @@ def test_respawning_modes_keep_every_agent_until_the_end(mode):
         if env.agents:
             assert not any(term.values()) and not any(trunc.values())
     assert all(term.values()) or all(trunc.values())
+
+
+# ------------------------------------------------------------- deathmatch and sudden death
+
+
+def test_arena_sizes():
+    assert ARENA_SIZES == {"mini": 600.0, "small": 1200.0, "medium": 2400.0, "large": 4800.0}
+
+
+def test_training_and_scenarios_default_to_sudden_death():
+    """Everything trained or evaluated so far was no-respawn elimination; that must not change."""
+    from marl_asteroids.config import SCENARIOS
+    assert GameConfig().mode == "sudden_death"
+    assert {cfg.mode for cfg in SCENARIOS.values()} == {"sudden_death"}
+    assert not TeamAsteroidsEnv(GameConfig()).persistent_agents
+
+
+def test_deathmatch_needs_a_clock_by_default():
+    assert make_game("deathmatch").max_frames == int(MODE_TIME_LIMIT["deathmatch"] * 60)
+
+
+def kill(env, victim, shooter):
+    """Destroy ``victim`` with a bullet from ``shooter`` during a normal step."""
+    ship = env.ships[victim]
+    assert ship.active, f"{victim} is already down"
+    ship.protection = 0
+    ship.apply_damage(ship.hp - 1)
+    park(env, victim, 50, 50)
+    owner = env.ships[shooter]
+    env.bullets = [Bullet(48, 50, 1.0, 0.0, shooter, owner.team_id, env.config)]
+    idle(env)
+    assert not ship.active
+
+
+def test_deathmatch_respawns_away_from_the_enemy():
+    env = env_for("deathmatch", arena="small", n_red=2, m_blue=2)
+    kill(env, "red_0", "blue_0")
+    assert "red_0" in env.agents and not env.game_over
+    idle(env, env.config.respawn_delay // env.config.action_repeat + 1)
+    ship = env.ships["red_0"]
+    assert ship.active and ship.protection > 0
+    nearest_enemy = min(env._wrapped_dist(ship.pos, env.ships[b].pos) for b in env.team_agents[BLUE])
+    assert nearest_enemy >= env.config.wave_spawn_distance * env.width - 1e-6
+
+
+def test_deathmatch_only_ends_on_the_clock_and_most_kills_wins():
+    env = env_for("deathmatch", arena="small", max_frames=60 * 5)
+    for a in env.team_agents[RED]:  # even a wiped-out team respawns
+        env.ships[a].protection = 0
+        env.ships[a].apply_damage(99)
+    idle(env)
+    assert not env.game_over
+    idle(env, env.config.respawn_delay // env.config.action_repeat + 1)  # red comes back
+    assert all(env.ships[a].active for a in env.team_agents[RED])
+    kill(env, "red_1", "blue_0")
+    kill(env, "blue_1", "red_0")
+    kill(env, "red_0", "blue_1")
+    assert env.team_kills == {RED: 1, BLUE: 2}
+    while env.agents:
+        idle(env)
+    assert env.game_over and env.winner == BLUE
+    assert env.summary() == {"mode": "deathmatch", "kills": {RED: 1, BLUE: 2}}
+
+
+def test_deathmatch_level_on_kills_is_a_draw():
+    env = env_for("deathmatch", arena="small", max_frames=60 * 5)
+    kill(env, "red_0", "blue_0")
+    kill(env, "blue_0", "red_1")
+    while env.agents:
+        idle(env)
+    assert env.winner == -1
+
+
+def test_team_kills_and_crashes_do_not_score():
+    env = env_for("deathmatch", arena="small", max_frames=60 * 5)
+    kill(env, "blue_1", "blue_0")              # friendly fire
+    env.ships["red_0"].protection = 0
+    env.ships["red_0"].apply_damage(99)        # destroyed by something other than enemy fire
+    idle(env)
+    assert env.team_kills == {RED: 0, BLUE: 0}
+
+
+def test_sudden_death_has_no_respawns_and_ends_on_elimination():
+    env = env_for("sudden_death", arena="small")
+    assert env.config.max_frames is None and not env.persistent_agents
+    kill(env, "red_0", "blue_0")
+    assert "red_0" not in env.agents and env.ships["red_0"].respawn_timer is None
+    kill(env, "red_1", "blue_0")
+    assert env.game_over and env.winner == BLUE
+
+
+def test_bots_score_in_deathmatch():
+    env = env_for("deathmatch", arena="small", max_frames=60 * 40)
+    play(env, blue="heuristic_1.0", red="dummy")
+    assert env.game_over and env.winner == BLUE and env.team_kills[BLUE] >= 2
 
 
 # ---------------------------------------------------------------------------------- bots

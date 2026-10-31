@@ -63,7 +63,7 @@ def main():
                      stochastic=args.stochastic, seed=args.seed)
     if args.mode or args.arena:
         spec.mode = args.mode or "deathmatch"
-        spec.arena = args.arena or "medium"
+        spec.arena = args.arena or "small"
         spec.m_blue, spec.n_red = args.blue_ships, args.red_ships
     # Per-ship controllers: a single value applies to the whole team; a comma-separated list
     # assigns per ship (cycled), e.g. --blue human,heuristic_1.0 puts you in blue_0 with a wingman.

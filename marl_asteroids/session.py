@@ -38,7 +38,7 @@ KEEP = "scenario"  # sentinel: leave this setting as the scenario defines it
 class MatchSpec:
     """Everything needed to set up a game. All fields are JSON-serializable.
 
-    Two ways to describe the arena: set ``arena`` (small/medium/large/huge) and ``mode`` to build a
+    Two ways to describe the arena: set ``arena`` (mini/small/medium/large) and ``mode`` to build a
     game from scratch (what the app does), or leave ``arena`` as None to start from a named
     ``scenario`` (what the command-line scripts and evaluation suites use).
     """

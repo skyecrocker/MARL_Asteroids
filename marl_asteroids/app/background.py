@@ -19,7 +19,7 @@ class MenuBackground:
     def __init__(self, size, effects: bool = True, seed: int = 0):
         self.size = size
         # A 3v3 station siege between bots: shows off the objective mode and restarts at the end
-        cfg = make_game("siege", "medium", 3, 3, time_limit=180.0, use_mode_time_limit=False)
+        cfg = make_game("siege", "small", 3, 3, time_limit=180.0, use_mode_time_limit=False)
         self.env = TeamAsteroidsEnv(cfg)
         self.renderer = Renderer(self.env, window=max(size), effects=effects, show_hud=False)
         self.blue = make_scripted("heuristic_1.0", seed=seed)

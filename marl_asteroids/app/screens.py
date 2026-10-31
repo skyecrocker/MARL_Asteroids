@@ -24,6 +24,9 @@ MODE_OPTIONS = [(MODE_NAMES[m], m) for m in MODES]
 ARENA_OPTIONS = [(f"{name.capitalize()} ({size:.0f})", name) for name, size in ARENA_SIZES.items()]
 SPAWN_OPTIONS = [("Fixed (facing off)", True), ("Random", False)]
 BOT = "heuristic_1.0"  # default AI in modes the trained agents haven't learned
+# Modes with an objective the trained agents can't see; fighting modes use them as-is
+OBJECTIVE_MODES = ("siege", "survival")
+COMBAT_MODES = ("deathmatch", "sudden_death")
 
 SCRIPTED = [
     ("Bot: heuristic", "heuristic_1.0"),
@@ -40,7 +43,7 @@ TEAM_SIZE_OPTIONS = [(str(n), n) for n in range(1, 5)]
 TIME_OPTIONS = [("No limit", None), ("1 minute", 60.0), ("2 minutes", 120.0),
                 ("3 minutes", 180.0), ("5 minutes", 300.0)]
 ROCK_OPTIONS = [("Split when shot", True), ("Solid (cover)", False)]
-MAX_ASTEROIDS = 30
+MAX_ASTEROIDS = 60
 
 
 def ship_label(agent: str) -> str:
@@ -228,7 +231,7 @@ def is_trained(controller: str) -> bool:
 def default_spec() -> MatchSpec:
     """You plus the strongest AI wingman against two of the strongest AI, 2v2 deathmatch."""
     ai = best_model(0)
-    return MatchSpec(mode="deathmatch", arena="medium", m_blue=2, n_red=2, difficulty="normal",
+    return MatchSpec(mode="deathmatch", arena="small", m_blue=2, n_red=2, difficulty="normal",
                      default_controller=ai,
                      controllers={"blue_0": HUMAN, "blue_1": ai, "red_0": ai, "red_1": ai})
 
@@ -242,12 +245,14 @@ def sanitize(spec: MatchSpec) -> MatchSpec:
         if not isinstance(value, int) or not 1 <= value <= 4:
             setattr(spec, side, 2)
     if not valid_controller(spec.default_controller):
-        spec.default_controller = best_model(0) if spec.mode == "deathmatch" else BOT
+        spec.default_controller = best_model(0) if spec.mode in COMBAT_MODES else BOT
     for agent, controller in list(spec.controllers.items()):
         if not valid_controller(controller):
             spec.controllers[agent] = spec.default_controller
     if spec.difficulty is not None and spec.difficulty not in DIFFICULTY:
         spec.difficulty = "normal"
+    if spec.mode == "deathmatch" and spec.time_limit is None:
+        spec.time_limit = KEEP  # respawning deathmatch only ends on the clock
     return spec
 
 
@@ -288,8 +293,8 @@ class SetupScreen(MenuScreen):
         self.spec.mode = mode
         self.spec.time_limit = KEEP  # each mode has its own sensible default clock
         self.status, self.status_is_error = "", False
-        if mode != "deathmatch":
-            # The trained agents only know deathmatch: they ignore stations and waves entirely.
+        if mode in OBJECTIVE_MODES:
+            # The trained agents only know combat: they ignore stations and waves entirely.
             # Swap them for objective-aware bots so the mode actually gets played.
             swapped = [a for a, c in self.spec.controllers.items() if is_trained(c)]
             for a in swapped:
@@ -297,8 +302,8 @@ class SetupScreen(MenuScreen):
             if is_trained(self.spec.default_controller):
                 self.spec.default_controller = BOT
             if swapped:
-                self.status = ("Trained agents only know deathmatch, so AI ships now use bots. "
-                               "You can still pick them.")
+                self.status = ("Trained agents only know combat modes, so AI ships now use "
+                               "bots. You can still pick them.")
         self.rebuild()
 
     def _set_arena(self, arena):
@@ -353,7 +358,7 @@ class SetupScreen(MenuScreen):
         red_label = "Max per wave" if mode == "survival" else "Red ships"
         self.choice(row(red_label), TEAM_SIZE_OPTIONS, cfg.n_red,
                     lambda v: self._set("n_red", v, rebuild=True))
-        if mode == "deathmatch":
+        if mode in COMBAT_MODES:
             self.choice(row("Spawns"), SPAWN_OPTIONS, self.spec.fixed_spawns,
                         lambda v: self._set("fixed_spawns", v))
 
@@ -366,7 +371,8 @@ class SetupScreen(MenuScreen):
         self.choice(row("Rocks"), ROCK_OPTIONS, cfg.asteroids_split,
                     lambda v: self._set("asteroids_split", v))
         default_frames = None if MODE_TIME_LIMIT[mode] is None else int(MODE_TIME_LIMIT[mode] * 60)
-        time_opts = [(f"Default ({format_time(default_frames)})", KEEP)] + TIME_OPTIONS
+        time_opts = [(f"Default ({format_time(default_frames)})", KEEP)] + [
+            o for o in TIME_OPTIONS if not (mode == "deathmatch" and o[1] is None)]  # needs a clock
         self.choice(row("Time limit"), time_opts, self.spec.time_limit,
                     lambda v: self._set("time_limit", v))
         self.preview = self.label((x, y + 4, card_w - 40, 26), "", "#hint")
@@ -402,8 +408,8 @@ class SetupScreen(MenuScreen):
         self.label((x, y, lw, 34), "Zoom")
         self.choice((x + lw, y, cw, 34), VIEW_OPTIONS, self.spec.view, lambda v: self._set("view", v))
         y += self.ROW
-        if mode != "deathmatch" and any(is_trained(c) for c in self.spec.controllers.values()):
-            hint = "Trained agents ignore the objective in this mode (they only know deathmatch)."
+        if mode in OBJECTIVE_MODES and any(is_trained(c) for c in self.spec.controllers.values()):
+            hint = "Trained agents ignore the objective in this mode (they only know combat)."
         elif humans:
             hint = "Difficulty slows AI reactions and reloads while you play."
         else:
@@ -617,6 +623,11 @@ class GameScreen(MenuScreen):
                 pygame.draw.rect(surface, (30, 34, 48), (rect.x, y + 22 + i * 8, bw, 5))
                 pygame.draw.rect(surface, c, (rect.x, y + 22 + i * 8, int(bw * f), 5))
             y += 52
+        if env.mode == "deathmatch":  # the score
+            n = env.team_kills[team]
+            surface.blit(self.font_big.render(f"{n} kill{'s' if n != 1 else ''}", True, col),
+                         (rect.x, y))
+            y += 34
         if env.mode == "survival" and team == RED:
             wave = (f"Wave {env.wave + 1} in {env.wave_cooldown / 60:.0f}s"
                     if env.wave_cooldown is not None else f"Wave {env.wave}")
@@ -679,7 +690,7 @@ class ResultsScreen(MenuScreen):
         cw = 560
         x = self.center_x(cw)
         y = int(h * 0.16)
-        mode = self.summary.get("mode", "deathmatch")
+        mode = self.summary.get("mode", "sudden_death")
         rows = [("Kills", "kills"), ("Damage dealt", "damage"),
                 ("Team kills", "teamkills"), ("Crashes", "env_deaths")]
         if mode == "siege":
@@ -697,7 +708,9 @@ class ResultsScreen(MenuScreen):
             title = {BLUE: "Blue wins", RED: "Red wins"}.get(self.winner, "Draw")
         self.label((x, y - 6, cw, 80), title, "#title")
         how = self._how()
-        self.label((x, y + 70, cw, 28), f"{how} after {self.frames / PHYSICS_FPS:.1f} s", "#subtitle")
+        # Deathmatch always runs to the clock, so its duration says nothing; the score does
+        sub = how if mode == "deathmatch" else f"{how} after {self.frames / PHYSICS_FPS:.1f} s"
+        self.label((x, y + 70, cw, 28), sub, "#subtitle")
 
         # Stats as a label grid: name column left-aligned, numbers right-aligned under each team
         s = self.stats
@@ -725,8 +738,14 @@ class ResultsScreen(MenuScreen):
 
     def _how(self) -> str:
         cfg = self.match.config
-        mode = self.summary.get("mode", "deathmatch")
+        mode = self.summary.get("mode", "sudden_death")
         timed_out = cfg.max_frames is not None and self.frames >= cfg.max_frames
+        if mode == "deathmatch":
+            kills = self.summary.get("kills", {})
+            b, r = kills.get(BLUE, 0), kills.get(RED, 0)
+            if self.winner == -1:
+                return f"Level on kills when time ran out: {b} to {r}"
+            return f"Most kills when time ran out: {max(b, r)} to {min(b, r)}"
         if mode == "survival":
             if timed_out:
                 return "Held out until the time limit"
